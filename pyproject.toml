@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gf-gcd"
+version = "0.1.0"
+description = "Grammar-constrained decoding for LLMs using Grammatical Framework grammars"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+# probability-fused decoding (GFProbConstraint, WordBeamSearcher) uses the
+# GF C runtime's Python binding
+probs = ["pgf>=1.1"]
+
+[tool.setuptools.packages.find]
+include = ["gf_gcd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
