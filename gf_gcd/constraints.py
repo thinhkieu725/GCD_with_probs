@@ -222,7 +222,7 @@ class GFProbConstraint(Constraint):
 
     def __init__(
         self,
-        grammar_dir: str,
+        grammar_dir: Optional[str] = None,
         default_grammar: Optional[str] = None,
         eos_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
@@ -231,6 +231,7 @@ class GFProbConstraint(Constraint):
         id_prefix: str = "t",
         concrete: Optional[str] = None,
         name: Optional[str] = None,
+        runtime: Optional["GFProbRuntime"] = None,  # noqa: F821
     ):
         """
         Args:
@@ -245,8 +246,18 @@ class GFProbConstraint(Constraint):
                 terminals (see `ids_to_gf_lin`); must match how the grammar
                 was tokenized. Digit-only terminals break the C runtime's
                 complete(), hence the non-numeric default "t".
+            runtime: an existing `GFProbRuntime` to reuse instead of building
+                one from `grammar_dir`/`default_grammar`/`concrete`. The GF
+                side of the fused score doesn't depend on `lambda_gf`, so
+                sharing one runtime (and its completion cache) across
+                several constraints that only differ in `lambda_gf` (e.g. a
+                λ sweep over the same prompt) avoids reloading the .pgf and
+                recomputing completions from scratch for each one.
+                `grammar_dir` may be omitted when `runtime` is given.
         """
-        if not os.path.isdir(grammar_dir):
+        if runtime is None and grammar_dir is None:
+            raise ValueError("either `grammar_dir` or `runtime` must be given")
+        if runtime is None and not os.path.isdir(grammar_dir):
             raise FileNotFoundError(f"grammar_dir does not exist: {grammar_dir}")
         self.grammar_dir = grammar_dir
         self.default_grammar = default_grammar
@@ -257,7 +268,7 @@ class GFProbConstraint(Constraint):
         self.id_prefix = id_prefix
         self.concrete = concrete
         self.name = name
-        self._runtime = None
+        self._runtime = runtime
 
     @property
     def runtime(self):

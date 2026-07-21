@@ -1,0 +1,169 @@
+"""Full pipeline: raw RGL grammar source -> word-level constrained LLM.
+
+Word-level counterpart of `full_pipeline.py`. Same grammar and probability
+file, same CONFIG-block style, but two of the token-level pipeline's stages
+disappear: word-level fusion (`WordBeamSearcher`) advances the beam one
+*grammar word* at a time over the natural word-level grammar, so nothing
+needs to be rewritten into a tokenizer's token IDs.
+
+  Stage 0  locate sources        grammars/rgl/{abstract,common,english,prelude,api}
+  Stage 1  compile with probs     gf -make --probs=...  (word-level Lang.pgf)
+  Stage 2  tokenize terminals     SKIPPED — no token-ID grammar is needed;
+                                    the word-level grammar is used as-is
+  Stage 3  compile token grammar  SKIPPED — same reason as stage 2
+  Stage 4  load LLM + runtime     GFProbRuntime + ConstrainedGenerator
+  Stage 5  generate                prompt from stdin, WordBeamSearcher per lambda
+
+One consequence worth knowing: this pipeline is tokenizer-independent (the
+same compiled Lang.pgf works for any model), whereas `full_pipeline.py` must
+recompile its token-ID grammar whenever MODEL_NAME's tokenizer changes.
+
+Cost warning specific to a real (non-toy) grammar: `WordBeamSearcher` scores
+every (beam, grammar-legal word) pair with one batched LM forward pass per
+step, so the batch width is beam_size * |legal continuations|. The toy Food
+grammar has a handful of legal words per step; Lang has hundreds to
+thousands (1593 at the very first step). Measured on CPU/gpt2, step 0 alone
+(1593 candidates, beam_size=1) took ~44s; deeper steps and beam_size=3 push
+this to minutes per step. BEAM_SIZE/MAX_WORDS below are kept small
+accordingly — raise them only if your hardware (typically a GPU, which
+batches this forward pass far more efficiently than CPU) can absorb it.
+
+All paths, names, and decoding knobs are constants in the CONFIG block below.
+
+Requires the `gf` binary on PATH and `pip install pgf`.
+
+    python examples/full_pipeline_word_level.py
+"""
+
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+from transformers import BitsAndBytesConfig
+
+from gf_gcd import ConstrainedGenerator, GFProbRuntime, WordBeamSearcher
+
+# ============================================================== CONFIG =====
+
+PROJECT_ROOT = Path(__file__).parent.parent
+
+# Stage 0/1 — grammar source
+GRAMMAR_SRC_DIR = PROJECT_ROOT / "grammars" / "rgl"          # where the .gf sources live
+GRAMMAR_SRC_SUBDIRS = ["abstract", "common", "english", "prelude", "api"]  # -> gf --path
+ABSTRACT_NAME = "Lang"                                        # abstract module name
+CONCRETE_NAME = "LangEng"                                     # concrete module to compile
+CONCRETE_FILE = GRAMMAR_SRC_DIR / "english" / f"{CONCRETE_NAME}.gf"
+PROBS_FILE = GRAMMAR_SRC_DIR / "test.probs"                   # gf -make --probs=
+
+# Stage 1 — compile output (no stage 2/3 output: no token-ID grammar exists)
+BUILD_DIR = GRAMMAR_SRC_DIR / "build"                         # all generated artifacts land here
+WORD_LEVEL_PGF = "Lang.pgf"                                   # gf -make default output name
+GF_BINARY = "gf"
+
+# Stage 4/5 — model + decoding
+# Device/quantization setup below is CUDA-specific — see docs/device_setup.md
+# for what to change to run on CPU-only or Apple Silicon (mps) instead.
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ungated on HF; alternative: "meta-llama/Llama-3.1-8B-Instruct" (gated, needs HF token + accepted license)
+DEVICE_MAP = "cuda"       # single-GPU placement; requires `accelerate`
+HALF_PRECISION = True     # float16 for the non-quantized layers (embeddings, norms)
+QUANTIZATION_CONFIG = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)  # requires `bitsandbytes`; keeps a 7-8B model comfortably under 12GB VRAM
+LAMBDAS = [0.0, 0.1, 0.3, 1.0]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
+BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
+MAX_WORDS = 8              # ditto
+NUM_RETURN = 1
+INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
+BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
+
+# ============================================================= /CONFIG =====
+
+
+def stage1_compile_word_level_grammar() -> Path:
+    """gf -make the concrete with probabilities; no canonicalization needed.
+
+    Unlike the token-level pipeline, this grammar is used exactly as
+    `WordBeamSearcher` finds it: terminals stay natural-language words, so
+    there is nothing downstream that needs the grammar's paradigms evaluated
+    down to plain literals.
+
+    Returns the path to the compiled word-level .pgf.
+    """
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    word_pgf = BUILD_DIR / WORD_LEVEL_PGF
+    if word_pgf.exists():
+        print(f"[stage 1] reusing cached {word_pgf}")
+        return word_pgf
+
+    cmd = [
+        GF_BINARY, "-make",
+        f"--probs={PROBS_FILE}",
+        f"--gfo-dir={BUILD_DIR}",  # keep .gfo build litter out of the source tree
+        "--path=" + ":".join(str(GRAMMAR_SRC_DIR / d) for d in GRAMMAR_SRC_SUBDIRS),
+        str(CONCRETE_FILE),
+    ]
+    print(f"[stage 1] compiling {CONCRETE_FILE.name} (one-time, takes a few minutes)...")
+    result = subprocess.run(cmd, cwd=BUILD_DIR, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"gf -make failed ({shlex.join(cmd)}):\n{result.stdout}\n{result.stderr}")
+    print(f"[stage 1] wrote {word_pgf}")
+    return word_pgf
+
+
+def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, prompt: str) -> None:
+    """Run one word-synchronized beam search per configured lambda and print the results."""
+    print(f"\nmodel={MODEL_NAME}  prompt={prompt!r}")
+
+    if INCLUDE_BASELINE_WITHOUT_CONSTRAINT:
+        print(f"baseline (no grammar fusion, num_beams={BEAM_SIZE}):")
+        result = generator.generate(
+            prompt, constraint=None, max_new_tokens=BASELINE_MAX_NEW_TOKENS, num_beams=BEAM_SIZE
+        )
+        print(f"  unconstrained  ->  {result.first_texts[0]!r}")
+
+    print(f"word-level fusion (WordBeamSearcher, beam={BEAM_SIZE}):")
+    for lam in LAMBDAS:
+        searcher = WordBeamSearcher(
+            generator.model,
+            generator.tokenizer,
+            runtime,
+            lambda_gf=lam,
+            beam_size=BEAM_SIZE,
+            gf_temperature=GF_TEMPERATURE,
+        )
+        hyps = searcher.search(prompt, max_words=MAX_WORDS, num_return=NUM_RETURN)
+        best = hyps[0]
+        print(
+            f"  lambda={lam:4.1f}  ->  {best.text!r}   "
+            f"(gf={best.gf_logprob:6.2f}, lm={best.llm_logprob:7.2f})"
+        )
+
+
+def main():
+    stage1_compile_word_level_grammar()
+    # stage 2 (tokenize terminals) and stage 3 (compile token grammar) are
+    # skipped — word-level fusion needs no token-ID grammar, see module docstring
+
+    generator = ConstrainedGenerator(
+        MODEL_NAME,
+        half_precision=HALF_PRECISION,
+        device_map=DEVICE_MAP,
+        hf_model_kwargs={"quantization_config": QUANTIZATION_CONFIG},
+    )
+    runtime = GFProbRuntime(BUILD_DIR, default_pgf=WORD_LEVEL_PGF)
+
+    prompt = input("Prompt: ").rstrip()
+    if not prompt:
+        sys.exit("empty prompt, nothing to do")
+
+    stage5_generate(generator, runtime, prompt)
+
+
+if __name__ == "__main__":
+    main()

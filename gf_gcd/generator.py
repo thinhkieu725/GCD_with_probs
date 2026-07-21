@@ -56,7 +56,7 @@ class ConstrainedGenerator:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if half_precision else torch.float32,
+            dtype=torch.float16 if half_precision else torch.float32,
             device_map=device_map,
             **(hf_model_kwargs or {}),
         )

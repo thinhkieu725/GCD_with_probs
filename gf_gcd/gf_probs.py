@@ -140,6 +140,16 @@ class GFProbRuntime:
         except pgf.ParseError:
             completions = []
         for cost, token, _cat, _fun in completions:
+            if not isinstance(token, str):
+                # pgf.BIND / pgf.SOFT_BIND: "glue the next literal to the
+                # previous one without a space" (contractions, compounds).
+                # Grammars whose terminals are all plain string literals
+                # (the toy grammars, or a tokenize_concrete_grammar output)
+                # never produce this; grammars compiled straight from
+                # source (e.g. the RGL) can. Neither token-level nor
+                # word-level candidates are meaningful sub-word glue
+                # instructions, so drop the candidate rather than crash.
+                continue
             scores.setdefault(token, []).append(-cost)
 
         merged = {token: _logsumexp(vals) for token, vals in scores.items()}

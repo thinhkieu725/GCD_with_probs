@@ -20,6 +20,9 @@ dev = ["pytest>=7.0"]
 # probability-fused decoding (GFProbConstraint, WordBeamSearcher) uses the
 # GF C runtime's Python binding
 probs = ["pgf>=1.1"]
+# device_map sharding/placement and bitsandbytes quantized (4-bit/8-bit)
+# model loading; see docs/device_setup.md (bitsandbytes is CUDA-only, no mps)
+gpu = ["accelerate>=0.26", "bitsandbytes>=0.43"]
 
 [tool.setuptools.packages.find]
 include = ["gf_gcd*"]
