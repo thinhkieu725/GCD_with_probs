@@ -7,6 +7,7 @@ invokes at every decoding step.
 """
 
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Callable, Iterable, List, Optional, Sequence
 
@@ -66,6 +67,7 @@ class GFConstraint(Constraint):
         port_start: int = 41296,
         gf_binary: str = "gf",
         name: Optional[str] = None,
+        verbose: bool = False,
     ):
         """
         Args:
@@ -76,6 +78,8 @@ class GFConstraint(Constraint):
                 Without it, a grammar that does not itself end with the EOS token
                 id will crash generation once the derivation completes.
             name: optional identifier, useful for experiment logging.
+            verbose: print per-decoding-step timing (GF server round-trip) to
+                the console. Useful for eyeballing where time goes during a run.
         """
         if not os.path.isdir(grammar_dir):
             raise FileNotFoundError(f"grammar_dir does not exist: {grammar_dir}")
@@ -83,6 +87,7 @@ class GFConstraint(Constraint):
         self.default_grammar = default_grammar
         self.eos_token_id = eos_token_id
         self.name = name
+        self.verbose = verbose
         self._runtime_kwargs = dict(pool_size=pool_size, port_start=port_start, gf_binary=gf_binary)
         self._runtime = None
 
@@ -110,7 +115,15 @@ class GFConstraint(Constraint):
             sent_tokens = sent_tokens.squeeze(0) if sent_tokens.dim() > 1 else sent_tokens
             generated = sent_tokens[prompt_lengths[batch_id]:]
             pgf = grammars[batch_id] if grammars is not None else None
+            t0 = time.perf_counter()
             allowed = self.runtime.get_prefix_allowed_tokens_for_LM(generated, pgf=pgf)
+            if self.verbose:
+                print(
+                    f"[gf-mask] batch={batch_id} step={len(generated):4d}  "
+                    f"gf-server complete={(time.perf_counter() - t0) * 1000:7.1f} ms  "
+                    f"allowed={len(allowed)}",
+                    flush=True,
+                )
             if not allowed and self.eos_token_id is not None:
                 return [self.eos_token_id]
             return allowed
@@ -154,6 +167,7 @@ class GFProbLogitsProcessor:
         grammars: Optional[Sequence[Optional[str]]] = None,
         pad_token_id: Optional[int] = None,
         id_prefix: str = "t",
+        verbose: bool = False,
     ):
         self.runtime = runtime
         self.prompt_lengths = list(prompt_lengths)
@@ -163,13 +177,28 @@ class GFProbLogitsProcessor:
         self.grammars = grammars
         self.pad_token_id = pad_token_id
         self.id_prefix = id_prefix
+        self.verbose = verbose
+        self._step = 0
+        self._last_step_end = None  # perf_counter() timestamp when __call__ last returned
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         from gf_gcd.gf_probs import GF_EOS
 
+        step_start = time.perf_counter()
+        # time since we last handed control back to `generate()`: covers the
+        # LM forward pass for this step (+ whatever sampling/processors ran
+        # before us). Not a clean isolated measurement, but a good proxy for
+        # "how long did computing the LLM's logits take" at a glance.
+        llm_forward_s = step_start - self._last_step_end if self._last_step_end is not None else None
+
         n_rows = input_ids.shape[0]
         group_size = n_rows // len(self.prompt_lengths)  # num_beams (or 1)
         fused = torch.full_like(scores, float("-inf"))
+
+        parse_s = 0.0  # time spent in pgf `complete()` (grammar parsing + probs)
+        combine_s = 0.0  # time spent fusing LM scores with GF log-probs
+        n_parsed = 0
+        n_finished = 0
 
         for row in range(n_rows):
             batch_id = row // group_size
@@ -180,17 +209,24 @@ class GFProbLogitsProcessor:
                 fused[row, self.eos_token_id] = scores[row, self.eos_token_id]
                 if self.pad_token_id is not None:
                     fused[row, self.pad_token_id] = scores[row, self.pad_token_id]
+                n_finished += 1
                 continue
 
             pgf_name = self.grammars[batch_id] if self.grammars is not None else None
+            t_parse_start = time.perf_counter()
             dist = self.runtime.next_token_logprobs(
                 [f"{self.id_prefix}{t}" for t in generated],
                 pgf_name=pgf_name,
                 temperature=self.gf_temperature,
             )
+            t_parse_end = time.perf_counter()
+            parse_s += t_parse_end - t_parse_start
+            n_parsed += 1
+
             if not dist:
                 # dead end (grammar exhausted): permit stopping
                 fused[row, self.eos_token_id] = scores[row, self.eos_token_id]
+                combine_s += time.perf_counter() - t_parse_end
                 continue
 
             for token, gf_logprob in dist.items():
@@ -207,7 +243,23 @@ class GFProbLogitsProcessor:
                             f"produced {token!r}"
                         ) from e
                 fused[row, idx] = scores[row, idx] + self.lambda_gf * gf_logprob
+            combine_s += time.perf_counter() - t_parse_end
 
+        step_end = time.perf_counter()
+
+        if self.verbose:
+            llm_str = f"{llm_forward_s * 1000:7.1f} ms" if llm_forward_s is not None else "    n/a   "
+            print(
+                f"[step {self._step:3d}] rows={n_rows:2d} (parsed={n_parsed}, finished={n_finished})  |  "
+                f"LLM logits (since prev step): {llm_str}  |  "
+                f"pgf complete() [parse]: {parse_s * 1000:7.1f} ms  |  "
+                f"combine logits: {combine_s * 1000:6.2f} ms  |  "
+                f"logits_processor total: {(step_end - step_start) * 1000:7.1f} ms",
+                flush=True,
+            )
+
+        self._step += 1
+        self._last_step_end = time.perf_counter()
         return fused
 
 
@@ -232,6 +284,7 @@ class GFProbConstraint(Constraint):
         concrete: Optional[str] = None,
         name: Optional[str] = None,
         runtime: Optional["GFProbRuntime"] = None,  # noqa: F821
+        verbose: bool = False,
     ):
         """
         Args:
@@ -254,6 +307,10 @@ class GFProbConstraint(Constraint):
                 λ sweep over the same prompt) avoids reloading the .pgf and
                 recomputing completions from scratch for each one.
                 `grammar_dir` may be omitted when `runtime` is given.
+            verbose: print a line per decoding step with the time spent
+                computing the LLM's logits (approx.), parsing/scoring via
+                `pgf complete()`, and combining the two, so processing time
+                per stage can be eyeballed during a run.
         """
         if runtime is None and grammar_dir is None:
             raise ValueError("either `grammar_dir` or `runtime` must be given")
@@ -265,6 +322,7 @@ class GFProbConstraint(Constraint):
         self.pad_token_id = pad_token_id
         self.lambda_gf = lambda_gf
         self.gf_temperature = gf_temperature
+        self.verbose = verbose
         self.id_prefix = id_prefix
         self.concrete = concrete
         self.name = name
@@ -300,6 +358,7 @@ class GFProbConstraint(Constraint):
             gf_temperature=self.gf_temperature,
             grammars=grammars,
             id_prefix=self.id_prefix,
+            verbose=self.verbose,
         )
 
     def prefix_allowed_tokens_fn(
@@ -314,9 +373,17 @@ class GFProbConstraint(Constraint):
             sent_tokens = sent_tokens.squeeze(0) if sent_tokens.dim() > 1 else sent_tokens
             generated = sent_tokens[prompt_lengths[batch_id] :].tolist()
             pgf = grammars[batch_id] if grammars is not None else None
+            t0 = time.perf_counter()
             dist = self.runtime.next_token_logprobs(
                 [f"{self.id_prefix}{t}" for t in generated], pgf_name=pgf
             )
+            if self.verbose:
+                print(
+                    f"[gf-mask] batch={batch_id} step={len(generated):4d}  "
+                    f"pgf complete()={(time.perf_counter() - t0) * 1000:7.1f} ms  "
+                    f"candidates={len(dist)}",
+                    flush=True,
+                )
             allowed = []
             for token in dist:
                 if token == GF_EOS:

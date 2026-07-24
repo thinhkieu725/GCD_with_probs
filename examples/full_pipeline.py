@@ -206,6 +206,7 @@ def stage4_load_model_and_constraint(
         lambda_gf=lambda_gf,
         gf_temperature=GF_TEMPERATURE,
         id_prefix=ID_PREFIX,
+        verbose=True # log the progress
     )
 
 
