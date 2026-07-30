@@ -56,9 +56,14 @@ inside HF's token loop:
 3. **Every decoding step** — HF calls
    [`GFProbLogitsProcessor.__call__`](../gf_gcd/constraints.py) with one
    row per beam hypothesis:
-   - strip the prompt, render generated IDs as grammar tokens
-     (`["t100", "t300"]`);
-   - query `next_token_logprobs` → `{token: ln P_GF}` incl. `GF_EOS`;
+   - strip the prompt, then locate the current *sentence* boundary within
+     what's left (`_SentenceCursor` — the grammar accepts one sentence, so
+     only the tail generated since the last boundary is rendered to
+     grammar tokens, e.g. `["t100", "t300"]`);
+   - query `next_token_logprobs` → `{token: ln P_GF}` incl. `GF_EOS`; at a
+     forced boundary (no legal continuation left) also fuse in the
+     grammar's own start-of-sentence tokens, so a beam can chain into
+     another sentence instead of only being allowed to stop;
    - `fused[t] = scores[t] + λ·ln P_GF(t)` for allowed `t`, `−inf`
      otherwise; `GF_EOS` maps to the real `eos_token_id`;
    - finished rows (EOS already emitted) pass through EOS/pad only.
@@ -71,9 +76,14 @@ inside HF's token loop:
 Loop in [`WordBeamSearcher.search`](../gf_gcd/word_beam.py); each
 iteration grows every hypothesis by one word:
 
-1. **Propose** — per hypothesis, `next_token_logprobs(hyp.words)` lists
-   legal next words with `ln P_GF` (incl. `GF_EOS` when stopping is
-   legal). The grammar is the proposer: nothing else can enter a beam.
+1. **Propose** — per hypothesis, `next_token_logprobs(hyp.sentence_words)`
+   (the current *sentence*'s words, not the hypothesis's whole history —
+   the grammar accepts only one sentence) lists legal next words with
+   `ln P_GF` (incl. `GF_EOS` when stopping is legal). At a forced boundary
+   (`GF_EOS` the only option), the proposer also offers the grammar's
+   start-of-sentence words, each forking the hypothesis into "begin
+   another sentence" alongside "end here". The grammar is the proposer:
+   nothing else can enter a beam.
 2. **Score** — `_score_expansions` computes
    `ln P_LM(word | prompt + words)` as the **sum of the word's subtoken
    log-probs** — e.g.

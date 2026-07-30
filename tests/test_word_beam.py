@@ -4,6 +4,7 @@ import math
 
 import pytest
 import torch
+from transformers import DynamicCache
 
 from gf_gcd.gf_probs import GFProbRuntime
 from gf_gcd.word_beam import WordBeamSearcher
@@ -40,10 +41,15 @@ class FakeModel(torch.nn.Module):
             logits[idx] = value
         self.register_buffer("base_logits", logits)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, past_key_values=None, use_cache=None, **kwargs):
         batch, length = input_ids.shape
         logits = self.base_logits.expand(batch, length, -1)
-        return type("Out", (), {"logits": logits})()
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        # dummy 1-layer cache: content is never read (logits are
+        # position-independent), only its sequence length matters
+        dummy = torch.zeros(batch, 1, past_len + length, 1)
+        cache = DynamicCache.from_legacy_cache(((dummy, dummy),))
+        return type("Out", (), {"logits": logits, "past_key_values": cache})()
 
 
 @pytest.fixture(scope="module")
@@ -51,12 +57,12 @@ def food_runtime(prob_grammar_dir):
     return GFProbRuntime(prob_grammar_dir, default_pgf="Food.pgf")
 
 
-def make_searcher(food_runtime, lambda_gf, bias=None, **kwargs):
+def make_searcher(food_runtime, lambda_gf, bias=None, beam_size=4, **kwargs):
     tok = FakeTokenizer(FOOD_WORDS)
     bias_ids = {tok.vocab[w]: v for w, v in (bias or {}).items()}
     model = FakeModel(tok.vocab_size, bias_ids)
     return WordBeamSearcher(
-        model, tok, food_runtime, lambda_gf=lambda_gf, beam_size=4, **kwargs
+        model, tok, food_runtime, lambda_gf=lambda_gf, beam_size=beam_size, **kwargs
     )
 
 
@@ -119,3 +125,24 @@ def test_num_return(food_runtime):
 def test_invalid_lambda_rejected(food_runtime):
     with pytest.raises(ValueError):
         make_searcher(food_runtime, lambda_gf=1.5)
+
+
+@requires_gf
+def test_search_can_chain_multiple_sentences(food_runtime):
+    # the Food grammar accepts one Comment; with a budget wide enough for
+    # two, and enough beam/return width to reach past the (always
+    # higher-scoring, per the fused formula) single-Comment completions,
+    # `search` should surface hypotheses that chain a second Comment after
+    # the first one completes.
+    searcher = make_searcher(food_runtime, lambda_gf=1.0, beam_size=64)
+    results = searcher.search("p", max_words=10, num_return=64)
+    chained = [h for h in results if h.finished and h.words.count("is") > 1]
+    assert chained, "expected at least one chained (multi-sentence) result"
+
+    best_chain = chained[0]
+    # words spans both sentences, but sentence_words -- what the next
+    # grammar query would see -- is only the *last* one
+    assert best_chain.words.count("is") == 2
+    assert best_chain.sentence_words.count("is") == 1
+    assert best_chain.words[-len(best_chain.sentence_words) :] == best_chain.sentence_words
+    assert best_chain.sentence_words != best_chain.words

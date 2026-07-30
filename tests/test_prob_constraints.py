@@ -58,10 +58,26 @@ class TestGFProbLogitsProcessor:
         assert fused[0, 200].item() == pytest.approx(0.0)
         assert fused[0, 300].item() == pytest.approx(0.0)
 
-    def test_complete_derivation_allows_only_eos(self, constraint):
+    def test_complete_derivation_allows_ending_or_a_new_sentence(self, constraint):
+        # "t100 t200" is complete with no legal continuation left: the
+        # fusion also scores the grammar's own start-of-sentence token
+        # (t100), so generation can chain into a second sentence instead of
+        # only being allowed to stop
         proc = constraint.logits_processor(prompt_lengths=[0])
         fused = proc(torch.tensor([[100, 200]]), torch.zeros((1, VOCAB)))
-        assert allowed_ids(fused[0]) == [EOS]
+        assert allowed_ids(fused[0]) == [EOS, 100]
+        # both are certain (P=1) one-step decisions: end here, or start a
+        # fresh sentence with the grammar's only possible first token
+        assert fused[0, EOS].item() == pytest.approx(0.0)
+        assert fused[0, 100].item() == pytest.approx(0.0)
+
+    def test_chains_a_second_sentence_after_the_first_completes(self, constraint):
+        proc = constraint.logits_processor(prompt_lengths=[0])
+        # "t100 t200" (complete) followed by "t100": scored against the tail
+        # of the second sentence alone (`[100]`), not the whole 3-token
+        # history, which the grammar cannot parse as one derivation
+        fused = proc(torch.tensor([[100, 200, 100]]), torch.zeros((1, VOCAB)))
+        assert allowed_ids(fused[0]) == [200, 300]
 
     def test_finished_row_passes_eos_through(self, constraint):
         proc = constraint.logits_processor(prompt_lengths=[0])
@@ -91,7 +107,11 @@ def test_prefix_allowed_tokens_fn_compat(constraint):
     fn = constraint.prefix_allowed_tokens_fn(prompt_lengths=[0])
     assert fn(0, torch.tensor([], dtype=torch.long)) == [100]
     assert sorted(fn(0, torch.tensor([100]))) == [200, 300]
-    assert fn(0, torch.tensor([100, 200])) == [EOS]
+    # complete, no legal continuation left: end here, or start a fresh sentence
+    assert sorted(fn(0, torch.tensor([100, 200]))) == [EOS, 100]
+    # a second sentence's tokens are masked against their own tail, not the
+    # unparseable 3-token history
+    assert sorted(fn(0, torch.tensor([100, 200, 100]))) == [200, 300]
 
 
 @requires_gf

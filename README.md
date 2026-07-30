@@ -108,6 +108,19 @@ after a space (`prefix_space`), and the grammar must eventually allow EOS —
 either encode the EOS token id in the grammar or set `eos_token_id` on
 `GFConstraint` as a fallback once the derivation is complete.
 
+**A compiled grammar accepts exactly one sentence.** All three decoding
+paths (`GFConstraint`, `GFProbConstraint`, `WordBeamSearcher`) query the
+grammar with only the tokens/words generated since the last sentence
+boundary, not the whole output — so `max_new_tokens`/`max_words` can span
+several grammar-conformant sentences rather than being wasted once the
+first one completes, or breaking the grammar's parse once a second
+sentence's tokens get appended to the first's. A new sentence can only
+begin right where the grammar forces the previous one to end (no legal
+continuation left); at that point generation may also just stop
+(`eos_token_id`/`GF_EOS`). See `_SentenceCursor` in
+[gf_gcd/constraints.py](gf_gcd/constraints.py) and `WordHypothesis.sentence_words`
+in [gf_gcd/word_beam.py](gf_gcd/word_beam.py) for the mechanism.
+
 ## Layout
 
 ```

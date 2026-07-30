@@ -33,6 +33,14 @@ This avoids ever re-encoding the growing "prompt + words so far" prefix from
 scratch — the previous design's `_score_expansions` did that once per
 candidate, per step (see git history), which made the LM side of this search
 scale roughly quadratically with `max_words`.
+
+The grammar itself only ever accepts *one* sentence, though, so the words
+proposed at each step are the continuations of the hypothesis's current
+sentence (`WordHypothesis.sentence_words`), not its whole history
+(`WordHypothesis.words`). Once a sentence has no legal continuation left,
+`search` forks it into ending there or starting another sentence from
+scratch, so one `search()` call can produce a `max_words`-bounded passage of
+several grammar-conformant sentences. See `WordBeamSearcher.search`.
 """
 
 from dataclasses import dataclass, field, replace
@@ -46,7 +54,11 @@ from gf_gcd.gf_probs import GF_EOS, GFProbRuntime
 
 @dataclass
 class WordHypothesis:
-    words: List[str] = field(default_factory=list)
+    words: List[str] = field(default_factory=list)  # every word so far, all sentences
+    # words of the *current* grammar sentence only -- what gets queried
+    # against the grammar; reset to [] whenever a sentence completes and
+    # the hypothesis starts another one. See `WordBeamSearcher.search`.
+    sentence_words: List[str] = field(default_factory=list)
     score: float = 0.0  # cumulative fused score
     gf_logprob: float = 0.0  # cumulative ln P_GF
     llm_logprob: float = 0.0  # cumulative ln P_LM
@@ -72,6 +84,10 @@ class _Expansion:
     llm_lp: float
     cache: DynamicCache  # batch-1, cropped to exactly this candidate's real length
     next_start_logits: torch.Tensor  # (vocab,) — logits predicting what comes after `word`
+    # True when `word` begins a *new* sentence (offered because the
+    # hypothesis's current sentence had no legal continuation left), rather
+    # than continuing `hyp.sentence_words`.
+    new_sentence: bool = False
 
 
 def _clone_cache(cache: DynamicCache) -> DynamicCache:
@@ -137,6 +153,23 @@ class WordBeamSearcher:
     ) -> List[WordHypothesis]:
         """Return finished hypotheses, best fused score first.
 
+        The grammar accepts exactly one sentence, so each hypothesis is
+        proposed continuations of its *current* sentence only
+        (`hyp.sentence_words`), not its whole `words` history. Whenever that
+        current sentence has no legal continuation left (`GF_EOS` is the
+        *only* candidate the grammar offers), the hypothesis forks: one
+        branch ends there (`GF_EOS` consumed, moved to `done`, scored via
+        the real EOS token like today), and one branch per legal
+        start-of-sentence word begins another sentence (`sentence_words`
+        reset to `[word]`, `words` keeps growing) -- so a single `search()`
+        call can produce a multi-sentence `max_words`-bounded passage of
+        grammar-conformant sentences, not just one. An *optional* stop
+        (`GF_EOS` alongside live continuations of the current sentence)
+        only competes with those continuations for ending the whole
+        hypothesis; it does not fork a new sentence, since a word that is
+        both a legal continuation and a legal sentence start would make
+        each fork's cumulative score ambiguous.
+
         Hypotheses that hit `max_words` without the grammar allowing an end
         are dropped; if *nothing* finishes, the best partial hypotheses are
         returned with `finished=False` so callers can inspect what happened.
@@ -157,15 +190,36 @@ class WordBeamSearcher:
             expansions: List[_Expansion] = []
             for hyp in beams:
                 dist = self.runtime.next_token_logprobs(
-                    hyp.words, pgf_name=pgf_name, temperature=self.gf_temperature
+                    hyp.sentence_words, pgf_name=pgf_name, temperature=self.gf_temperature
                 )
                 if not dist:
                     continue
                 words_i = list(dist.keys())
                 gf_lps = list(dist.values())
+                new_sentence_flags = [False] * len(words_i)
+
+                if GF_EOS in dist and set(dist) == {GF_EOS}:
+                    # current sentence has no legal continuation left: also
+                    # offer starting a fresh sentence, in addition to (and
+                    # scored independently of) ending the hypothesis here
+                    stop_lp = dist[GF_EOS]
+                    start_dist = self.runtime.next_token_logprobs(
+                        [], pgf_name=pgf_name, temperature=self.gf_temperature
+                    )
+                    for word, start_lp in start_dist.items():
+                        if word == GF_EOS:
+                            continue  # an empty sentence isn't a real continuation
+                        words_i.append(word)
+                        gf_lps.append(stop_lp + start_lp)
+                        new_sentence_flags.append(True)
+
                 scored = self._score_hyp_candidates(hyp, words_i)
-                for word, gf_lp, (llm_lp, cache, next_start_logits) in zip(words_i, gf_lps, scored):
-                    expansions.append(_Expansion(hyp, word, gf_lp, llm_lp, cache, next_start_logits))
+                for word, gf_lp, new_sentence, (llm_lp, cache, next_start_logits) in zip(
+                    words_i, gf_lps, new_sentence_flags, scored
+                ):
+                    expansions.append(
+                        _Expansion(hyp, word, gf_lp, llm_lp, cache, next_start_logits, new_sentence)
+                    )
             if not expansions:
                 break
 
@@ -196,10 +250,12 @@ class WordBeamSearcher:
             continuations.sort(key=lambda t: t[0], reverse=True)
             new_beams: List[WordHypothesis] = []
             for total_score, e in continuations[: self.beam_size]:
+                new_sentence_words = [e.word] if e.new_sentence else list(e.hyp.sentence_words) + [e.word]
                 new_beams.append(
                     replace(
                         e.hyp,
                         words=list(e.hyp.words) + [e.word],
+                        sentence_words=new_sentence_words,
                         score=total_score,
                         gf_logprob=e.hyp.gf_logprob + e.gf_lp,
                         llm_logprob=e.hyp.llm_logprob + e.llm_lp,
