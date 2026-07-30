@@ -79,8 +79,17 @@ GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards unif
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
 MAX_WORDS = 8              # ditto
 NUM_RETURN = 1
+# Search-quality knobs (see WordBeamSearcher.__init__ for the full rationale
+# behind each). None of these change lambda_gf's grammar/LM tradeoff -- they
+# make the beam search around it smarter.
+LENGTH_PENALTY = 0.8       # GNMT-style exponent; 0 = off (raw log-prob sum, biased toward
+                           # whichever hypothesis finishes fewer words first); ~0.6-1.0 corrects it
+DIVERSITY_PENALTY = 0.3    # per-step penalty on a word already claimed by a higher-ranked
+                           # survivor this step; 0 = off, larger = more lexically diverse beam
+NO_REPEAT_NGRAM_SIZE = 3   # block candidates that would recreate an already-seen n-gram; 0 = off
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
 BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
+SHOW_TIMER = False  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
 
 # ============================================================= /CONFIG =====
 
@@ -136,6 +145,10 @@ def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, pro
             lambda_gf=lam,
             beam_size=BEAM_SIZE,
             gf_temperature=GF_TEMPERATURE,
+            length_penalty=LENGTH_PENALTY,
+            diversity_penalty=DIVERSITY_PENALTY,
+            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+            verbose=SHOW_TIMER
         )
         hyps = searcher.search(prompt, max_words=MAX_WORDS, num_return=NUM_RETURN)
         best = hyps[0]

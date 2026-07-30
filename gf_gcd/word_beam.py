@@ -41,8 +41,22 @@ sentence (`WordHypothesis.sentence_words`), not its whole history
 `search` forks it into ending there or starting another sentence from
 scratch, so one `search()` call can produce a `max_words`-bounded passage of
 several grammar-conformant sentences. See `WordBeamSearcher.search`.
+
+Three optional knobs make the search itself smarter, independent of the
+grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
+`WordBeamSearcher.__init__` for details):
+
+- `length_penalty` -- GNMT-style normalization so hypotheses that finish at
+  different word counts (e.g. a 3-word vs. an 8-word sentence) are compared
+  fairly instead of the raw cumulative log-prob favoring whichever is shorter.
+- `diversity_penalty` -- discourages every surviving hypothesis from picking
+  the same next word, which otherwise collapses a beam of size N into N
+  near-identical continuations.
+- `no_repeat_ngram_size` -- blocks candidates that would recreate an n-gram
+  already generated earlier in the same hypothesis.
 """
 
+import time
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
 
@@ -118,6 +132,10 @@ class WordBeamSearcher:
         gf_temperature: float = 1.0,
         prefix_space: bool = True,
         scoring_chunk_size: int = 64,
+        length_penalty: float = 0.0,
+        diversity_penalty: float = 0.0,
+        no_repeat_ngram_size: int = 0,
+        verbose: bool = False,
     ):
         """
         Args:
@@ -131,6 +149,32 @@ class WordBeamSearcher:
                 (see `_score_hyp_candidates`). Lower it if scoring still runs
                 out of GPU memory on a step with many legal candidates;
                 raise it for more throughput if memory allows.
+            length_penalty: GNMT-style length-normalization exponent, applied
+                only when *comparing* hypotheses that may have a different
+                number of words (finished-vs-live early stopping, and the
+                final ranking of `done`) — never when picking survivors
+                within a single step, since those are always the same length.
+                Raw cumulative log-probs get more negative every extra word,
+                which biases those comparisons toward whichever hypothesis
+                happened to finish first; 0.0 (default) reproduces that raw
+                behavior, ~0.6-1.0 corrects for it.
+            diversity_penalty: when selecting the `beam_size` survivors of a
+                step, each candidate word already claimed by a higher-ranked
+                survivor *this step* has this much subtracted from its score
+                before the next pick (only for selection, not from the score
+                that gets carried forward). Counters beam collapse, where
+                every surviving hypothesis picks the same top word and the
+                beam stops exploring alternatives. 0.0 (default) disables it
+                and falls back to a plain top-`beam_size` sort.
+            no_repeat_ngram_size: block a candidate word if appending it
+                would recreate an n-gram (of this size) already present
+                earlier in the hypothesis's full word history. 0 (default)
+                disables it. Mirrors `transformers`' generation-time
+                `no_repeat_ngram_size`, adapted to whole-word candidates.
+            verbose: print per-word-step timing (grammar proposals via `pgf
+                complete()`, LM forward passes scoring candidates, and
+                fusing/pruning the beam), so processing time per stage can be
+                eyeballed during a run.
         """
         if not 0.0 <= lambda_gf <= 1.0:
             raise ValueError(f"lambda_gf must be in [0, 1], got {lambda_gf}")
@@ -142,6 +186,10 @@ class WordBeamSearcher:
         self.gf_temperature = gf_temperature
         self.prefix_space = prefix_space
         self.scoring_chunk_size = scoring_chunk_size
+        self.length_penalty = length_penalty
+        self.diversity_penalty = diversity_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.verbose = verbose
 
     @torch.no_grad()
     def search(
@@ -176,7 +224,14 @@ class WordBeamSearcher:
         """
         device = next(self.model.parameters()).device
         prompt_ids = torch.tensor([self.tokenizer.encode(prompt)], device=device)
+        t0 = time.perf_counter()
         out = self.model(input_ids=prompt_ids, use_cache=True)
+        if self.verbose:
+            print(
+                f"[word-step init] prompt tokens={prompt_ids.shape[1]}  "
+                f"LLM forward (encode prompt)={(time.perf_counter() - t0) * 1000:7.1f} ms",
+                flush=True,
+            )
         init_cache = out.past_key_values
         if not isinstance(init_cache, DynamicCache):
             init_cache = DynamicCache.from_legacy_cache(init_cache)
@@ -185,13 +240,21 @@ class WordBeamSearcher:
         beams = [WordHypothesis(past_key_values=init_cache, next_start_logits=init_logits)]
         done: List[WordHypothesis] = []
 
-        for _ in range(max_words):
+        for step_idx in range(max_words):
+            step_start = time.perf_counter()
+            n_hyps = len(beams)
+            grammar_s = 0.0  # time in `pgf complete()` (grammar proposals)
+            llm_s = 0.0  # time in `_score_hyp_candidates` (LM forward passes)
+            n_candidates = 0
+
             # ---- grammar proposals + LM scores, one batched forward per hypothesis
             expansions: List[_Expansion] = []
             for hyp in beams:
+                t0 = time.perf_counter()
                 dist = self.runtime.next_token_logprobs(
                     hyp.sentence_words, pgf_name=pgf_name, temperature=self.gf_temperature
                 )
+                grammar_s += time.perf_counter() - t0
                 if not dist:
                     continue
                 words_i = list(dist.keys())
@@ -203,9 +266,11 @@ class WordBeamSearcher:
                     # offer starting a fresh sentence, in addition to (and
                     # scored independently of) ending the hypothesis here
                     stop_lp = dist[GF_EOS]
+                    t0 = time.perf_counter()
                     start_dist = self.runtime.next_token_logprobs(
                         [], pgf_name=pgf_name, temperature=self.gf_temperature
                     )
+                    grammar_s += time.perf_counter() - t0
                     for word, start_lp in start_dist.items():
                         if word == GF_EOS:
                             continue  # an empty sentence isn't a real continuation
@@ -213,7 +278,15 @@ class WordBeamSearcher:
                         gf_lps.append(stop_lp + start_lp)
                         new_sentence_flags.append(True)
 
+                if self.no_repeat_ngram_size > 0:
+                    words_i, gf_lps, new_sentence_flags = self._filter_repeats(
+                        hyp.words, words_i, gf_lps, new_sentence_flags
+                    )
+
+                t0 = time.perf_counter()
                 scored = self._score_hyp_candidates(hyp, words_i)
+                llm_s += time.perf_counter() - t0
+                n_candidates += len(words_i)
                 for word, gf_lp, new_sentence, (llm_lp, cache, next_start_logits) in zip(
                     words_i, gf_lps, new_sentence_flags, scored
                 ):
@@ -221,12 +294,15 @@ class WordBeamSearcher:
                         _Expansion(hyp, word, gf_lp, llm_lp, cache, next_start_logits, new_sentence)
                     )
             if not expansions:
+                if self.verbose:
+                    print(f"[word-step {step_idx:3d}] no live expansions, stopping", flush=True)
                 break
 
             # ---- fuse; EOS candidates are always kept (like the grammar side,
             # they don't compete for the beam_size live slots), continuations
             # compete for the top beam_size — only *those* survivors pay for
             # extracting their own KV-cache row.
+            t_combine_start = time.perf_counter()
             continuations: List[Tuple[float, _Expansion]] = []
             for e in expansions:
                 step_score = self.lambda_gf * e.gf_lp + (1.0 - self.lambda_gf) * e.llm_lp
@@ -247,9 +323,14 @@ class WordBeamSearcher:
                 else:
                     continuations.append((total_score, e))
 
-            continuations.sort(key=lambda t: t[0], reverse=True)
+            if self.diversity_penalty > 0.0 and len(continuations) > self.beam_size:
+                survivors = self._select_diverse(continuations)
+            else:
+                continuations.sort(key=lambda t: t[0], reverse=True)
+                survivors = continuations[: self.beam_size]
+
             new_beams: List[WordHypothesis] = []
-            for total_score, e in continuations[: self.beam_size]:
+            for total_score, e in survivors:
                 new_sentence_words = [e.word] if e.new_sentence else list(e.hyp.sentence_words) + [e.word]
                 new_beams.append(
                     replace(
@@ -264,20 +345,94 @@ class WordBeamSearcher:
                     )
                 )
             beams = new_beams  # already sorted best-first, at most beam_size long
+            combine_s = time.perf_counter() - t_combine_start
 
-            # nothing alive can beat what is already finished
+            if self.verbose:
+                print(
+                    f"[word-step {step_idx:3d}] hyps={n_hyps:2d} candidates={n_candidates:5d} "
+                    f"live={len(beams)} done={len(done)}  |  "
+                    f"pgf complete() [parse]: {grammar_s * 1000:7.1f} ms  |  "
+                    f"LLM forward [_score_hyp_candidates]: {llm_s * 1000:8.1f} ms  |  "
+                    f"combine+prune: {combine_s * 1000:6.2f} ms  |  "
+                    f"step total: {(time.perf_counter() - step_start) * 1000:8.1f} ms",
+                    flush=True,
+                )
+
+            # nothing alive can beat what is already finished -- compare with
+            # length normalization since live beams still have fewer words
+            # than hypotheses that already finished (or vice versa)
             if done and beams:
-                if max(h.score for h in beams) < min(h.score for h in done):
+                if max(self._normalized_score(h) for h in beams) < min(
+                    self._normalized_score(h) for h in done
+                ):
                     if len(done) >= (num_return or self.beam_size):
                         break
             if not beams:
                 break
 
-        done.sort(key=lambda h: h.score, reverse=True)
-        results = done or sorted(beams, key=lambda h: h.score, reverse=True)
+        done.sort(key=self._normalized_score, reverse=True)
+        results = done or sorted(beams, key=self._normalized_score, reverse=True)
         return results[: num_return or self.beam_size]
 
     # ------------------------------------------------------------- scoring
+
+    def _length_norm(self, n_words: int) -> float:
+        """GNMT-style length normalization factor; 1.0 (no-op) when disabled."""
+        if self.length_penalty == 0.0:
+            return 1.0
+        return ((5.0 + max(n_words, 1)) / 6.0) ** self.length_penalty
+
+    def _normalized_score(self, hyp: WordHypothesis) -> float:
+        return hyp.score / self._length_norm(len(hyp.words))
+
+    def _select_diverse(
+        self, continuations: List[Tuple[float, "_Expansion"]]
+    ) -> List[Tuple[float, "_Expansion"]]:
+        """Greedily pick `beam_size` survivors, penalizing words already
+        claimed by a higher-ranked pick this step (Hamming diversity) so the
+        beam doesn't collapse onto near-duplicate continuations."""
+        remaining = list(continuations)
+        word_counts: dict = {}
+        selected: List[Tuple[float, _Expansion]] = []
+        while remaining and len(selected) < self.beam_size:
+            remaining.sort(
+                key=lambda t: t[0] - self.diversity_penalty * word_counts.get(t[1].word, 0),
+                reverse=True,
+            )
+            picked = remaining.pop(0)
+            selected.append(picked)
+            word_counts[picked[1].word] = word_counts.get(picked[1].word, 0) + 1
+        return selected
+
+    def _filter_repeats(
+        self,
+        history: List[str],
+        words: List[str],
+        gf_lps: List[float],
+        flags: List[bool],
+    ) -> Tuple[List[str], List[float], List[bool]]:
+        """Drop candidates that would recreate an n-gram already present in
+        `history` (`no_repeat_ngram_size`). `GF_EOS` is never blocked, and if
+        blocking would remove every candidate, the unfiltered lists are
+        returned instead (never leaves a hypothesis with nowhere to go)."""
+        ctx_len = self.no_repeat_ngram_size - 1
+        if len(history) < ctx_len:
+            return words, gf_lps, flags
+        context = tuple(history[len(history) - ctx_len :]) if ctx_len > 0 else ()
+        banned = {
+            history[i + ctx_len]
+            for i in range(len(history) - ctx_len)
+            if tuple(history[i : i + ctx_len]) == context
+        }
+        if not banned:
+            return words, gf_lps, flags
+        kept = [
+            (w, lp, f) for w, lp, f in zip(words, gf_lps, flags) if w == GF_EOS or w not in banned
+        ]
+        if not kept:
+            return words, gf_lps, flags
+        kept_words, kept_lps, kept_flags = zip(*kept)
+        return list(kept_words), list(kept_lps), list(kept_flags)
 
     def _candidate_ids(self, word: str) -> List[int]:
         if word == GF_EOS:
@@ -317,6 +472,9 @@ class WordBeamSearcher:
         first_lp = torch.log_softmax(hyp.next_start_logits.float(), dim=-1)
 
         results: List[Tuple[float, DynamicCache, torch.Tensor]] = []
+        n_chunks = 0
+        forward_s = 0.0  # model forward + log_softmax over its logits
+        postprocess_s = 0.0  # per-candidate cache/logit extraction
         for start in range(0, len(token_lists), self.scoring_chunk_size):
             chunk = token_lists[start : start + self.scoring_chunk_size]
             m = len(chunk)
@@ -336,6 +494,7 @@ class WordBeamSearcher:
             position_ids = torch.arange(past_len, past_len + max_k, device=device).unsqueeze(0).expand(m, -1)
             cache_position = torch.arange(past_len, past_len + max_k, device=device)
 
+            t0 = time.perf_counter()
             out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -345,6 +504,9 @@ class WordBeamSearcher:
                 use_cache=True,
             )
             logprobs = torch.log_softmax(out.logits.float(), dim=-1)  # (m, max_k, vocab)
+            t1 = time.perf_counter()
+            forward_s += t1 - t0
+            n_chunks += 1
 
             for i, ids in enumerate(chunk):
                 k = len(ids)
@@ -355,6 +517,15 @@ class WordBeamSearcher:
                 row_logits = logprobs[i, k - 1, :].clone()
                 results.append((lp, row_cache, row_logits))
 
+            postprocess_s += time.perf_counter() - t1
             del out, logprobs, cache
+
+        if self.verbose:
+            print(
+                f"    [llm-score] candidates={len(token_lists):5d} chunks={n_chunks}  "
+                f"forward+softmax={forward_s * 1000:8.1f} ms  "
+                f"postprocess={postprocess_s * 1000:6.2f} ms",
+                flush=True,
+            )
 
         return results

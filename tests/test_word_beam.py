@@ -6,8 +6,8 @@ import pytest
 import torch
 from transformers import DynamicCache
 
-from gf_gcd.gf_probs import GFProbRuntime
-from gf_gcd.word_beam import WordBeamSearcher
+from gf_gcd.gf_probs import GF_EOS, GFProbRuntime
+from gf_gcd.word_beam import WordBeamSearcher, WordHypothesis, _Expansion
 
 from .conftest import requires_gf
 
@@ -146,3 +146,67 @@ def test_search_can_chain_multiple_sentences(food_runtime):
     assert best_chain.sentence_words.count("is") == 1
     assert best_chain.words[-len(best_chain.sentence_words) :] == best_chain.sentence_words
     assert best_chain.sentence_words != best_chain.words
+
+
+# ---------------------------------------------------------------------------
+# Pure-algorithm unit tests for the search-quality knobs (length_penalty,
+# diversity_penalty, no_repeat_ngram_size) -- these helpers touch no
+# model/tokenizer/runtime, so no GF grammar or fake LM is needed.
+
+
+def _bare_searcher(**kwargs):
+    return WordBeamSearcher(model=None, tokenizer=None, runtime=None, **kwargs)
+
+
+def test_length_norm_is_noop_by_default():
+    s = _bare_searcher()
+    assert s._length_norm(1) == 1.0
+    assert s._length_norm(10) == 1.0
+
+
+def test_length_norm_narrows_the_gap_between_different_lengths():
+    s = _bare_searcher(length_penalty=0.8)
+    short = WordHypothesis(words=["a"], score=-1.0)
+    long_ = WordHypothesis(words=["a"] * 8, score=-6.0)
+    # raw score favors `short`; normalization should shrink that gap since
+    # `long_` only "lost" by accumulating more (necessarily negative) words
+    assert short.score > long_.score
+    raw_gap = short.score - long_.score
+    normalized_gap = s._normalized_score(short) - s._normalized_score(long_)
+    assert 0 <= normalized_gap < raw_gap
+
+
+def test_filter_repeats_blocks_recreated_ngram():
+    s = _bare_searcher(no_repeat_ngram_size=2)
+    words, gf_lps, flags = s._filter_repeats(
+        history=["a", "b", "a"],
+        words=["b", "c", GF_EOS],
+        gf_lps=[0.1, 0.2, 0.3],
+        flags=[False, False, False],
+    )
+    # "a" -> "b" already occurred once, so "b" is banned as the next word
+    # after another "a"; "c" and GF_EOS are unaffected
+    assert "b" not in words
+    assert set(words) == {"c", GF_EOS}
+    assert len(words) == len(gf_lps) == len(flags)
+
+
+def test_filter_repeats_never_empties_the_candidate_list():
+    s = _bare_searcher(no_repeat_ngram_size=2)
+    words, gf_lps, flags = s._filter_repeats(
+        history=["a", "b"], words=["b"], gf_lps=[0.1], flags=[False]
+    )
+    # banning the only candidate would leave nowhere to go -> fall back unfiltered
+    assert words == ["b"]
+
+
+def test_select_diverse_avoids_two_survivors_with_the_same_word():
+    s = _bare_searcher(beam_size=2, diversity_penalty=5.0)
+    h1, h2 = WordHypothesis(), WordHypothesis()
+    e_best_x = _Expansion(h1, "x", 0.0, 0.0, None, None)
+    e_second_x = _Expansion(h2, "x", 0.0, -0.1, None, None)
+    e_y = _Expansion(h1, "y", 0.0, -1.0, None, None)
+    # without diversity, the top 2 by raw score would both be "x"
+    continuations = [(0.0, e_best_x), (-0.1, e_second_x), (-1.0, e_y)]
+    survivors = s._select_diverse(continuations)
+    assert {e.word for _, e in survivors} == {"x", "y"}
