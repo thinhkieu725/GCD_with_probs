@@ -24,10 +24,14 @@ after it (`next_start_logits`). At each step, per hypothesis:
 2. `ln P(candidate's first token | prefix)` comes from the *previous* step's
    `next_start_logits` (a plain lookup, no forward pass needed) — a fresh
    forward pass only ever scores tokens *after* the first one of a candidate.
-3. Once global pruning picks the survivors for this step, each survivor's own
-   row is sliced out of that batched result (cropped to its real token count,
-   dropping any padding used to batch same-step candidates of differing
-   subword length) and becomes its cache for the next step.
+3. Once global pruning picks the survivors for this step (typically a
+   handful out of many hundreds-to-thousands of scored candidates), each
+   survivor gets one more small forward pass, over just its own tokens, to
+   materialize the cache it carries forward -- see `_materialize`. This is
+   deliberately *not* done during scoring for every candidate: with beam_size
+   in the single digits, almost every scored candidate is pruned away, so
+   slicing a KV-cache row per candidate up front would spend most of that
+   work on hypotheses that are immediately discarded.
 
 This avoids ever re-encoding the growing "prompt + words so far" prefix from
 scratch — the previous design's `_score_expansions` did that once per
@@ -89,15 +93,17 @@ class WordHypothesis:
 
 @dataclass
 class _Expansion:
-    """One (hypothesis, candidate word) pair, already scored, carrying its
-    own (small, pre-cropped) KV-cache slice in case it survives pruning."""
+    """One (hypothesis, candidate word) pair, already scored by the LM.
+
+    Deliberately carries no KV-cache: at any step, thousands of candidates
+    get scored but only `beam_size` survive pruning, so extracting a cache
+    slice per candidate would throw away >99% of that work. Survivors get
+    their cache materialized after pruning instead, see `_materialize`."""
 
     hyp: WordHypothesis
     word: str
     gf_lp: float
     llm_lp: float
-    cache: DynamicCache  # batch-1, cropped to exactly this candidate's real length
-    next_start_logits: torch.Tensor  # (vocab,) — logits predicting what comes after `word`
     # True when `word` begins a *new* sentence (offered because the
     # hypothesis's current sentence had no legal continuation left), rather
     # than continuing `hyp.sentence_words`.
@@ -284,15 +290,13 @@ class WordBeamSearcher:
                     )
 
                 t0 = time.perf_counter()
-                scored = self._score_hyp_candidates(hyp, words_i)
+                llm_lps = self._score_hyp_candidates(hyp, words_i)
                 llm_s += time.perf_counter() - t0
                 n_candidates += len(words_i)
-                for word, gf_lp, new_sentence, (llm_lp, cache, next_start_logits) in zip(
-                    words_i, gf_lps, new_sentence_flags, scored
+                for word, gf_lp, new_sentence, llm_lp in zip(
+                    words_i, gf_lps, new_sentence_flags, llm_lps
                 ):
-                    expansions.append(
-                        _Expansion(hyp, word, gf_lp, llm_lp, cache, next_start_logits, new_sentence)
-                    )
+                    expansions.append(_Expansion(hyp, word, gf_lp, llm_lp, new_sentence))
             if not expansions:
                 if self.verbose:
                     print(f"[word-step {step_idx:3d}] no live expansions, stopping", flush=True)
@@ -329,9 +333,16 @@ class WordBeamSearcher:
                 continuations.sort(key=lambda t: t[0], reverse=True)
                 survivors = continuations[: self.beam_size]
 
+            combine_s = time.perf_counter() - t_combine_start
+
+            # ---- only the (beam_size-ish) survivors ever need real KV-cache
+            # state to carry forward, so materialize it here instead of for
+            # every scored candidate above.
+            t_materialize_start = time.perf_counter()
             new_beams: List[WordHypothesis] = []
             for total_score, e in survivors:
                 new_sentence_words = [e.word] if e.new_sentence else list(e.hyp.sentence_words) + [e.word]
+                cache, next_start_logits = self._materialize(e.hyp, e.word)
                 new_beams.append(
                     replace(
                         e.hyp,
@@ -340,12 +351,12 @@ class WordBeamSearcher:
                         score=total_score,
                         gf_logprob=e.hyp.gf_logprob + e.gf_lp,
                         llm_logprob=e.hyp.llm_logprob + e.llm_lp,
-                        past_key_values=e.cache,
-                        next_start_logits=e.next_start_logits,
+                        past_key_values=cache,
+                        next_start_logits=next_start_logits,
                     )
                 )
             beams = new_beams  # already sorted best-first, at most beam_size long
-            combine_s = time.perf_counter() - t_combine_start
+            materialize_s = time.perf_counter() - t_materialize_start
 
             if self.verbose:
                 print(
@@ -354,6 +365,7 @@ class WordBeamSearcher:
                     f"pgf complete() [parse]: {grammar_s * 1000:7.1f} ms  |  "
                     f"LLM forward [_score_hyp_candidates]: {llm_s * 1000:8.1f} ms  |  "
                     f"combine+prune: {combine_s * 1000:6.2f} ms  |  "
+                    f"materialize survivors: {materialize_s * 1000:6.2f} ms  |  "
                     f"step total: {(time.perf_counter() - step_start) * 1000:8.1f} ms",
                     flush=True,
                 )
@@ -440,11 +452,9 @@ class WordBeamSearcher:
         text = (" " + word) if self.prefix_space else word
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def _score_hyp_candidates(
-        self, hyp: WordHypothesis, words: Sequence[str]
-    ) -> List[Tuple[float, DynamicCache, torch.Tensor]]:
-        """Score every candidate word for `hyp`, one (llm_lp, cache, next_start_logits)
-        triple per candidate, in the same order as `words`.
+    def _score_hyp_candidates(self, hyp: WordHypothesis, words: Sequence[str]) -> List[float]:
+        """Score every candidate word for `hyp`, returning one `llm_lp` per
+        candidate, in the same order as `words`.
 
         Feeds only each candidate's own tokens, using `hyp`'s cached
         "prompt + hyp.words" as `past_key_values` (expanded across a chunk of
@@ -456,11 +466,17 @@ class WordBeamSearcher:
         real grammar, unlike a toy one, can have hundreds-to-thousands of
         legal next words), so this chunks the forward pass — batching all of
         them into one call blows past GPU memory just for the logits tensor
-        (vocab-sized, times candidate count, times sequence position). Each
-        candidate's cache/logits are cropped down to its own real length
-        immediately after its chunk computes, so what's kept around after
-        this call is small (one candidate's worth) rather than a whole
-        chunk's padded batch.
+        (vocab-sized, times candidate count, times sequence position).
+
+        This only computes log-probabilities — no KV-cache is extracted here.
+        Of the (up to) thousands of candidates scored per hypothesis, only
+        `beam_size` survive pruning each step, so eagerly slicing a cache per
+        candidate would waste the vast majority of that work; survivors get
+        their cache materialized separately, see `_materialize`. Per-chunk
+        results are pulled off the GPU with a single batched `.tolist()`
+        rather than one `.item()` per token, which avoids a GPU/CPU sync per
+        token — the dominant cost once candidate counts run into the
+        thousands.
         """
         device = next(self.model.parameters()).device
         pad_id = self.tokenizer.pad_token_id
@@ -471,10 +487,10 @@ class WordBeamSearcher:
         past_len = hyp.past_key_values.get_seq_length()
         first_lp = torch.log_softmax(hyp.next_start_logits.float(), dim=-1)
 
-        results: List[Tuple[float, DynamicCache, torch.Tensor]] = []
+        results: List[float] = []
         n_chunks = 0
-        forward_s = 0.0  # model forward + log_softmax over its logits
-        postprocess_s = 0.0  # per-candidate cache/logit extraction
+        forward_s = 0.0  # model forward + log_softmax + gather over its logits
+        postprocess_s = 0.0  # pulling the batched result off the GPU
         for start in range(0, len(token_lists), self.scoring_chunk_size):
             chunk = token_lists[start : start + self.scoring_chunk_size]
             m = len(chunk)
@@ -504,19 +520,21 @@ class WordBeamSearcher:
                 use_cache=True,
             )
             logprobs = torch.log_softmax(out.logits.float(), dim=-1)  # (m, max_k, vocab)
+
+            # lp(candidate) = first_lp[ids[0]] + sum_{j=1..k-1} logprobs[j-1, ids[j]],
+            # vectorized over the whole chunk instead of a per-token Python loop.
+            first_ids = input_ids[:, 0]  # (m,)
+            step_lp = first_lp[first_ids]  # (m,)
+            if max_k > 1:
+                targets = input_ids[:, 1:]  # (m, max_k-1)
+                gathered = logprobs[:, :-1, :].gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (m, max_k-1)
+                valid = new_mask[:, 1:].to(gathered.dtype)  # 0 past each candidate's real length
+                step_lp = step_lp + (gathered * valid).sum(dim=1)
             t1 = time.perf_counter()
             forward_s += t1 - t0
             n_chunks += 1
 
-            for i, ids in enumerate(chunk):
-                k = len(ids)
-                lp = first_lp[ids[0]].item()
-                for j in range(1, k):
-                    lp += logprobs[i, j - 1, ids[j]].item()
-                row_cache = _extract_row_cache(out.past_key_values, i, past_len + k)
-                row_logits = logprobs[i, k - 1, :].clone()
-                results.append((lp, row_cache, row_logits))
-
+            results.extend(step_lp.tolist())  # one GPU/CPU sync for the whole chunk
             postprocess_s += time.perf_counter() - t1
             del out, logprobs, cache
 
@@ -529,3 +547,34 @@ class WordBeamSearcher:
             )
 
         return results
+
+    def _materialize(self, hyp: WordHypothesis, word: str) -> Tuple[DynamicCache, torch.Tensor]:
+        """Run the forward pass for exactly one candidate word (a pruning
+        survivor) and return the (cache, next_start_logits) it carries
+        forward as the new hypothesis's incremental-decoding state.
+
+        Only called for the `beam_size`-ish survivors of a step, never for
+        every scored candidate — see `_score_hyp_candidates` and `_Expansion`.
+        """
+        device = next(self.model.parameters()).device
+        ids = self._candidate_ids(word)
+        k = len(ids)
+        past_len = hyp.past_key_values.get_seq_length()
+
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones((1, past_len + k), dtype=torch.long, device=device)
+        position_ids = torch.arange(past_len, past_len + k, device=device).unsqueeze(0)
+        cache_position = torch.arange(past_len, past_len + k, device=device)
+        cache = _clone_cache(hyp.past_key_values)
+
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        next_start_logits = out.logits[0, -1, :].float().clone()
+        new_cache = _extract_row_cache(out.past_key_values, 0, past_len + k)
+        return new_cache, next_start_logits

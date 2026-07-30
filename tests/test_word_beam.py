@@ -203,9 +203,9 @@ def test_filter_repeats_never_empties_the_candidate_list():
 def test_select_diverse_avoids_two_survivors_with_the_same_word():
     s = _bare_searcher(beam_size=2, diversity_penalty=5.0)
     h1, h2 = WordHypothesis(), WordHypothesis()
-    e_best_x = _Expansion(h1, "x", 0.0, 0.0, None, None)
-    e_second_x = _Expansion(h2, "x", 0.0, -0.1, None, None)
-    e_y = _Expansion(h1, "y", 0.0, -1.0, None, None)
+    e_best_x = _Expansion(h1, "x", 0.0, 0.0)
+    e_second_x = _Expansion(h2, "x", 0.0, -0.1)
+    e_y = _Expansion(h1, "y", 0.0, -1.0)
     # without diversity, the top 2 by raw score would both be "x"
     continuations = [(0.0, e_best_x), (-0.1, e_second_x), (-1.0, e_y)]
     survivors = s._select_diverse(continuations)
