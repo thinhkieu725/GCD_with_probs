@@ -85,6 +85,19 @@ Note `torch.backends.mps.is_available()` must be `True` (macOS 12.3+, an
 `mps`-built torch) — no extra `pip install` beyond base `torch` is needed,
 unlike the CUDA path's `accelerate`/`bitsandbytes`.
 
+### Segfault during `from_pretrained` ("Loading weights: 0%" then crash)
+
+`transformers` >= ~4.57 loads weights across a 4-thread pool
+(`core_model_loading.py`'s `GLOBAL_WORKERS`), and those threads each call
+`tensor.to(device="mps", dtype=...)` concurrently. The MPS backend isn't
+safe for concurrent submission like that and segfaults, almost always at
+0% before any progress is shown. Both example scripts already set
+`os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")` when
+`DEVICE_MAP == "mps"`, which forces sequential (single-threaded) weight
+loading and avoids the race. If you hit this outside the examples (e.g. a
+custom script calling `from_pretrained` directly), set that env var
+yourself before the call.
+
 ## Picking automatically instead of hardcoding
 
 If you'd rather not hand-edit the CONFIG block per machine, replace the

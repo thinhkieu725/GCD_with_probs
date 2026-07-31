@@ -75,18 +75,22 @@ class _Expansion:
 
 
 def _clone_cache(cache: DynamicCache) -> DynamicCache:
-    legacy = cache.to_legacy_cache()
-    return DynamicCache.from_legacy_cache(tuple((k.clone(), v.clone()) for k, v in legacy))
+    return DynamicCache(
+        ddp_cache_data=tuple((layer.keys.clone(), layer.values.clone()) for layer in cache.layers)
+    )
 
 
 def _extract_row_cache(cache: DynamicCache, row: int, length: int) -> DynamicCache:
     """Slice out one batch row, cropped to `length`, as a fresh batch-1 cache."""
-    legacy = cache.to_legacy_cache()
-    new_legacy = tuple(
-        (k[row : row + 1, :, :length, :].clone(), v[row : row + 1, :, :length, :].clone())
-        for k, v in legacy
+    return DynamicCache(
+        ddp_cache_data=tuple(
+            (
+                layer.keys[row : row + 1, :, :length, :].clone(),
+                layer.values[row : row + 1, :, :length, :].clone(),
+            )
+            for layer in cache.layers
+        )
     )
-    return DynamicCache.from_legacy_cache(new_legacy)
 
 
 class WordBeamSearcher:
@@ -102,6 +106,7 @@ class WordBeamSearcher:
         gf_temperature: float = 1.0,
         prefix_space: bool = True,
         scoring_chunk_size: int = 64,
+        length_alpha: float = 1.0,
     ):
         """
         Args:
@@ -115,6 +120,11 @@ class WordBeamSearcher:
                 (see `_score_hyp_candidates`). Lower it if scoring still runs
                 out of GPU memory on a step with many legal candidates;
                 raise it for more throughput if memory allows.
+            length_alpha: hypotheses are ranked by `score / len(words)**length_alpha`
+                rather than the raw cumulative score. Every extra word can only
+                add a <=0 term to the raw sum, so un-normalized ranking always
+                favors stopping as soon as the grammar allows it; 0.0 recovers
+                that raw-sum behaviour, 1.0 ranks by mean per-word score.
         """
         if not 0.0 <= lambda_gf <= 1.0:
             raise ValueError(f"lambda_gf must be in [0, 1], got {lambda_gf}")
@@ -126,6 +136,12 @@ class WordBeamSearcher:
         self.gf_temperature = gf_temperature
         self.prefix_space = prefix_space
         self.scoring_chunk_size = scoring_chunk_size
+        self.length_alpha = length_alpha
+
+    def _ranked(self, score: float, num_words: int) -> float:
+        """Length-normalized score used wherever hypotheses of potentially
+        different lengths are compared (see `length_alpha` above)."""
+        return score if num_words <= 0 else score / (num_words**self.length_alpha)
 
     @torch.no_grad()
     def search(
@@ -145,8 +161,7 @@ class WordBeamSearcher:
         prompt_ids = torch.tensor([self.tokenizer.encode(prompt)], device=device)
         out = self.model(input_ids=prompt_ids, use_cache=True)
         init_cache = out.past_key_values
-        if not isinstance(init_cache, DynamicCache):
-            init_cache = DynamicCache.from_legacy_cache(init_cache)
+        assert isinstance(init_cache, DynamicCache), f"expected DynamicCache, got {type(init_cache)}"
         init_logits = out.logits[0, -1, :].float()
 
         beams = [WordHypothesis(past_key_values=init_cache, next_start_logits=init_logits)]
@@ -193,7 +208,7 @@ class WordBeamSearcher:
                 else:
                     continuations.append((total_score, e))
 
-            continuations.sort(key=lambda t: t[0], reverse=True)
+            continuations.sort(key=lambda t: self._ranked(t[0], len(t[1].hyp.words) + 1), reverse=True)
             new_beams: List[WordHypothesis] = []
             for total_score, e in continuations[: self.beam_size]:
                 new_beams.append(
@@ -209,16 +224,19 @@ class WordBeamSearcher:
                 )
             beams = new_beams  # already sorted best-first, at most beam_size long
 
-            # nothing alive can beat what is already finished
+            # nothing alive can beat what is already finished (length-normalized,
+            # since live and finished hypotheses here can have different lengths)
             if done and beams:
-                if max(h.score for h in beams) < min(h.score for h in done):
+                live_best = max(self._ranked(h.score, len(h.words)) for h in beams)
+                done_worst = min(self._ranked(h.score, len(h.words)) for h in done)
+                if live_best < done_worst:
                     if len(done) >= (num_return or self.beam_size):
                         break
             if not beams:
                 break
 
-        done.sort(key=lambda h: h.score, reverse=True)
-        results = done or sorted(beams, key=lambda h: h.score, reverse=True)
+        done.sort(key=lambda h: self._ranked(h.score, len(h.words)), reverse=True)
+        results = done or sorted(beams, key=lambda h: self._ranked(h.score, len(h.words)), reverse=True)
         return results[: num_return or self.beam_size]
 
     # ------------------------------------------------------------- scoring

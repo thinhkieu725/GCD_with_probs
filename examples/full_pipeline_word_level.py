@@ -35,13 +35,11 @@ Requires the `gf` binary on PATH and `pip install pgf`.
     python examples/full_pipeline_word_level.py
 """
 
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
-
-import torch
-from transformers import BitsAndBytesConfig
 
 from gf_gcd import ConstrainedGenerator, GFProbRuntime, WordBeamSearcher
 
@@ -63,21 +61,23 @@ WORD_LEVEL_PGF = "Lang.pgf"                                   # gf -make default
 GF_BINARY = "gf"
 
 # Stage 4/5 — model + decoding
-# Device/quantization setup below is CUDA-specific — see docs/device_setup.md
-# for what to change to run on CPU-only or Apple Silicon (mps) instead.
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ungated on HF; alternative: "meta-llama/Llama-3.1-8B-Instruct" (gated, needs HF token + accepted license)
-DEVICE_MAP = "cuda"       # single-GPU placement; requires `accelerate`
-HALF_PRECISION = True     # float16 for the non-quantized layers (embeddings, norms)
-QUANTIZATION_CONFIG = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-)  # requires `bitsandbytes`; keeps a 7-8B model comfortably under 12GB VRAM
+# Device setup below is Apple Silicon (mps) — see docs/device_setup.md for
+# what to change to run on CUDA or CPU-only instead.
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  # small enough to fit unquantized in unified memory
+# MODEL_NAME = "gpt2"  # small enough to fit unquantized in unified memory
+DEVICE_MAP = "mps"        # single-GPU placement; requires `accelerate`
+HALF_PRECISION = True     # float16 works fine on mps and halves memory
+QUANTIZATION_CONFIG = None  # bitsandbytes doesn't support mps; no 4-bit path here
+if DEVICE_MAP == "mps":
+    # transformers' parallel weight-loading thread pool races on the MPS backend
+    # (multiple threads calling tensor.to(device="mps") concurrently) and segfaults
+    # during from_pretrained — force sequential loading. See docs/device_setup.md.
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 LAMBDAS = [0.0, 0.1, 0.3, 1.0]  # grammar weight sweep; lambda_gf must be in [0, 1] here
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
 MAX_WORDS = 8              # ditto
+LENGTH_ALPHA = 1.0         # rank hypotheses by score / len(words)**LENGTH_ALPHA; 0.0 = raw cumulative score
 NUM_RETURN = 1
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
 BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
@@ -136,6 +136,7 @@ def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, pro
             lambda_gf=lam,
             beam_size=BEAM_SIZE,
             gf_temperature=GF_TEMPERATURE,
+            length_alpha=LENGTH_ALPHA,
         )
         hyps = searcher.search(prompt, max_words=MAX_WORDS, num_return=NUM_RETURN)
         best = hyps[0]
@@ -154,7 +155,6 @@ def main():
         MODEL_NAME,
         half_precision=HALF_PRECISION,
         device_map=DEVICE_MAP,
-        hf_model_kwargs={"quantization_config": QUANTIZATION_CONFIG},
     )
     runtime = GFProbRuntime(BUILD_DIR, default_pgf=WORD_LEVEL_PGF)
 

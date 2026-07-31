@@ -21,14 +21,14 @@ Requires the `gf` binary on PATH and `pip install pgf`.
     python examples/full_pipeline.py
 """
 
+import os
 import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-import torch
-from transformers import AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoTokenizer
 
 from gf_gcd import ConstrainedGenerator, GFProbConstraint, GFProbRuntime
 from gf_gcd.grammar_tools import compile_grammar, ids_to_gf_lin, tokenize_terminal
@@ -56,17 +56,18 @@ GF_BINARY = "gf"
 ID_PREFIX = "t"   # non-numeric marker required by the C runtime's complete() (see grammar_tools/tokenize.py)
 
 # Stage 4/5 — model + decoding
-# Device/quantization setup below is CUDA-specific — see docs/device_setup.md
-# for what to change to run on CPU-only or Apple Silicon (mps) instead.
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ungated on HF; alternative: "meta-llama/Llama-3.1-8B-Instruct" (gated, needs HF token + accepted license)
-DEVICE_MAP = "cuda"       # single-GPU placement; requires `accelerate`
-HALF_PRECISION = True     # float16 for the non-quantized layers (embeddings, norms)
-QUANTIZATION_CONFIG = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-)  # requires `bitsandbytes`; keeps a 7-8B model comfortably under 12GB VRAM
+# Device setup below is Apple Silicon (mps) — see docs/device_setup.md for
+# what to change to run on CUDA or CPU-only instead.
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  # small enough to fit unquantized in unified memory
+# MODEL_NAME = "gpt2"  # small enough to fit unquantized in unified memory
+DEVICE_MAP = "mps"        # single-GPU placement; requires `accelerate`
+HALF_PRECISION = True     # float16 works fine on mps and halves memory
+QUANTIZATION_CONFIG = None  # bitsandbytes doesn't support mps; no 4-bit path here
+if DEVICE_MAP == "mps":
+    # transformers' parallel weight-loading thread pool races on the MPS backend
+    # (multiple threads calling tensor.to(device="mps") concurrently) and segfaults
+    # during from_pretrained — force sequential loading. See docs/device_setup.md.
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 LAMBDAS = [0.0, 0.3, 1.0]  # grammar weight sweep; 0.0 = pure masking (binary GCD)
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 NUM_BEAMS = 2
@@ -246,7 +247,6 @@ def main():
         MODEL_NAME,
         half_precision=HALF_PRECISION,
         device_map=DEVICE_MAP,
-        hf_model_kwargs={"quantization_config": QUANTIZATION_CONFIG},
     )
 
     prompt = input("Prompt: ").rstrip()
