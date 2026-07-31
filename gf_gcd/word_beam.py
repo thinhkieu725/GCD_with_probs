@@ -58,6 +58,19 @@ grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
   near-identical continuations.
 - `no_repeat_ngram_size` -- blocks candidates that would recreate an n-gram
   already generated earlier in the same hypothesis.
+
+`do_sample=True` switches to a second, independent decoding mode: instead of
+pooling every hypothesis's candidates into one list and keeping the globally
+best `beam_size` (deterministic beam search, the default), each of the
+`beam_size` hypotheses independently draws its own next word from its own
+temperature/top-k/top-p/min-p/typical-p-filtered distribution -- the same
+"chat model" style sampling `do_sample=True` triggers in
+`transformers.generate()`, just hand-rolled over grammar words instead of LM
+tokens. It does not reuse the pooled top-`beam_size` cut at all: hypotheses
+never compete with each other, `diversity_penalty` (which only makes sense
+for that pooled competition) is rejected alongside it, and `GF_EOS` is just
+another candidate in the draw rather than an automatic, uncontested survivor.
+See `WordBeamSearcher._sample_index` and the `do_sample` argument docstring.
 """
 
 import time
@@ -125,6 +138,57 @@ def _extract_row_cache(cache: DynamicCache, row: int, length: int) -> DynamicCac
     return DynamicCache.from_legacy_cache(new_legacy)
 
 
+# ---------------------------------------------------------------------------
+# Sampling filters -- 1-D ports of `transformers.generation.logits_process`'s
+# TopKLogitsWarper / TopPLogitsWarper / MinPLogitsWarper / TypicalLogitsWarper,
+# adapted from vocab-sized batched tensors to the (much smaller) per-step
+# candidate set a grammar step offers. Each takes a 1-D tensor of fused
+# `step_score`s and returns a copy with excluded entries set to -inf;
+# `min_tokens_to_keep` guarantees at least one survivor so a step never ends
+# up with nowhere to sample from.
+
+
+def _filter_top_k(logits: torch.Tensor, top_k: int, min_tokens_to_keep: int = 1) -> torch.Tensor:
+    top_k = min(max(top_k, min_tokens_to_keep), logits.shape[-1])
+    kth_value = torch.topk(logits, top_k).values[-1]
+    return logits.masked_fill(logits < kth_value, float("-inf"))
+
+
+def _filter_top_p(logits: torch.Tensor, top_p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+    sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    sorted_remove = cumulative_probs <= (1 - top_p)
+    sorted_remove[-min_tokens_to_keep:] = False
+    remove = torch.zeros_like(sorted_remove).scatter(0, sorted_indices, sorted_remove)
+    return logits.masked_fill(remove, float("-inf"))
+
+
+def _filter_min_p(logits: torch.Tensor, min_p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+    probs = torch.softmax(logits, dim=-1)
+    threshold = min_p * probs.max()
+    remove = probs < threshold
+    sorted_indices = torch.argsort(logits, descending=True)
+    sorted_remove = remove.gather(0, sorted_indices)
+    sorted_remove[:min_tokens_to_keep] = False
+    remove = torch.zeros_like(remove).scatter(0, sorted_indices, sorted_remove)
+    return logits.masked_fill(remove, float("-inf"))
+
+
+def _filter_typical_p(logits: torch.Tensor, typical_p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+    normalized = torch.log_softmax(logits, dim=-1)
+    p = torch.exp(normalized)
+    entropy = -(normalized * p).nansum()
+    shifted = torch.abs((-normalized) - entropy)
+    sorted_scores, sorted_indices = torch.sort(shifted, descending=False)
+    sorted_logits = logits.gather(0, sorted_indices)
+    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    last_ind = min(int((cumulative_probs < typical_p).sum().item()), sorted_scores.shape[-1] - 1)
+    sorted_remove = sorted_scores > sorted_scores[last_ind]
+    sorted_remove[:min_tokens_to_keep] = False
+    remove = torch.zeros_like(sorted_remove).scatter(0, sorted_indices, sorted_remove)
+    return logits.masked_fill(remove, float("-inf"))
+
+
 class WordBeamSearcher:
     """Beam search over grammar words, scored jointly by grammar and LM."""
 
@@ -141,6 +205,13 @@ class WordBeamSearcher:
         length_penalty: float = 0.0,
         diversity_penalty: float = 0.0,
         no_repeat_ngram_size: int = 0,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        typical_p: float = 1.0,
+        seed: Optional[int] = None,
         verbose: bool = False,
     ):
         """
@@ -177,13 +248,61 @@ class WordBeamSearcher:
                 earlier in the hypothesis's full word history. 0 (default)
                 disables it. Mirrors `transformers`' generation-time
                 `no_repeat_ngram_size`, adapted to whole-word candidates.
+            do_sample: use independent per-hypothesis sampling instead of
+                deterministic beam search (see the module docstring). Under
+                sampling, `beam_size` is repurposed as "number of independent
+                parallel chains" (like HF's `num_return_sequences` with
+                `do_sample=True, num_beams=1`) rather than a competing beam
+                width. Mutually exclusive with `diversity_penalty > 0`
+                (diversity penalty only makes sense for the pooled
+                competition that sampling mode skips).
+            temperature: scales the *fused* `step_score` before top-k/top-p/
+                min-p/typical-p filtering, only when `do_sample=True`. This is
+                distinct from `gf_temperature` above, which flattens the
+                grammar's own distribution *before* fusion -- the ordering
+                mirrors Phase 1 (`GFProbLogitsProcessor` fuses first, HF's
+                sampling warpers run after). `temperature <= 1e-5` is treated
+                as greedy (argmax) to avoid dividing by ~0.
+            top_k: keep only the `top_k` highest-fused-score candidates before
+                sampling. 0 (default) disables it. Only used when
+                `do_sample=True`.
+            top_p: nucleus sampling -- keep the smallest set of candidates
+                whose cumulative probability reaches `top_p`. 1.0 (default)
+                disables it. Only used when `do_sample=True`.
+            min_p: keep candidates whose probability is at least
+                `min_p * (probability of the top candidate)`. 0.0 (default)
+                disables it. An alternative to `top_p`; only used when
+                `do_sample=True`.
+            typical_p: locally typical sampling -- keep the smallest set of
+                candidates (by closeness of their surprisal to the
+                distribution's entropy) whose cumulative probability reaches
+                `typical_p`. 1.0 (default) disables it. Another alternative
+                to `top_p`; only used when `do_sample=True`.
+            seed: if given, used to seed the `torch.Generator` driving every
+                sampling draw, for reproducible runs. Only used when
+                `do_sample=True`.
             verbose: print per-word-step timing (grammar proposals via `pgf
                 complete()`, LM forward passes scoring candidates, and
-                fusing/pruning the beam), so processing time per stage can be
-                eyeballed during a run.
+                fusing/pruning or sampling the beam), so processing time per
+                stage can be eyeballed during a run.
         """
         if not 0.0 <= lambda_gf <= 1.0:
             raise ValueError(f"lambda_gf must be in [0, 1], got {lambda_gf}")
+        if do_sample and diversity_penalty > 0.0:
+            raise ValueError(
+                "do_sample and diversity_penalty are mutually exclusive: diversity_penalty "
+                "only corrects the pooled top-beam_size selection of deterministic beam "
+                "search, which do_sample bypasses entirely (each hypothesis samples "
+                "independently, so there is no shared competition to diversify)."
+            )
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {min_p}")
+        if not 0.0 < typical_p <= 1.0:
+            raise ValueError(f"typical_p must be in (0, 1], got {typical_p}")
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
         self.model = model
         self.tokenizer = tokenizer
         self.runtime = runtime
@@ -195,6 +314,13 @@ class WordBeamSearcher:
         self.length_penalty = length_penalty
         self.diversity_penalty = diversity_penalty
         self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.min_p = min_p
+        self.typical_p = typical_p
+        self._generator = torch.Generator().manual_seed(seed) if seed is not None else None
         self.verbose = verbose
 
     @torch.no_grad()
@@ -243,7 +369,21 @@ class WordBeamSearcher:
             init_cache = DynamicCache.from_legacy_cache(init_cache)
         init_logits = out.logits[0, -1, :].float()
 
-        beams = [WordHypothesis(past_key_values=init_cache, next_start_logits=init_logits)]
+        if self.do_sample:
+            # unlike pooled beam search -- which starts from one hypothesis and
+            # *grows* to beam_size as the pooled top-k selects several distinct
+            # continuations of it -- independent sampling advances each live
+            # hypothesis by exactly one word per step, so it can never fan out
+            # on its own. Seed `beam_size` independent chains up front instead
+            # (sharing the same read-only initial cache/logits is safe: both
+            # `_score_hyp_candidates` and `_materialize` clone a hypothesis's
+            # cache before ever touching it).
+            beams = [
+                WordHypothesis(past_key_values=init_cache, next_start_logits=init_logits)
+                for _ in range(self.beam_size)
+            ]
+        else:
+            beams = [WordHypothesis(past_key_values=init_cache, next_start_logits=init_logits)]
         done: List[WordHypothesis] = []
 
         for step_idx in range(max_words):
@@ -254,7 +394,9 @@ class WordBeamSearcher:
             n_candidates = 0
 
             # ---- grammar proposals + LM scores, one batched forward per hypothesis
-            expansions: List[_Expansion] = []
+            expansions: List[_Expansion] = []  # pooled path (do_sample=False) only
+            sampled_beams: List[WordHypothesis] = []  # sampling path (do_sample=True) only
+            select_s = 0.0  # sampling path only: time spent drawing each hypothesis's next word
             for hyp in beams:
                 t0 = time.perf_counter()
                 dist = self.runtime.next_token_logprobs(
@@ -293,10 +435,96 @@ class WordBeamSearcher:
                 llm_lps = self._score_hyp_candidates(hyp, words_i)
                 llm_s += time.perf_counter() - t0
                 n_candidates += len(words_i)
-                for word, gf_lp, new_sentence, llm_lp in zip(
-                    words_i, gf_lps, new_sentence_flags, llm_lps
-                ):
-                    expansions.append(_Expansion(hyp, word, gf_lp, llm_lp, new_sentence))
+
+                if self.do_sample:
+                    # independent draw for *this* hypothesis alone: unlike the
+                    # pooled path below, GF_EOS is just one more candidate in
+                    # the distribution (it can be sampled, but doesn't
+                    # automatically win), and this hypothesis never competes
+                    # with any other hypothesis's candidates for a shared slot.
+                    t0 = time.perf_counter()
+                    step_scores = torch.tensor(
+                        [
+                            self.lambda_gf * gf_lp + (1.0 - self.lambda_gf) * llm_lp
+                            for gf_lp, llm_lp in zip(gf_lps, llm_lps)
+                        ],
+                        dtype=torch.float32,
+                    )
+                    idx = self._sample_index(step_scores)
+                    select_s += time.perf_counter() - t0
+                    word, gf_lp, llm_lp, new_sentence = (
+                        words_i[idx],
+                        gf_lps[idx],
+                        llm_lps[idx],
+                        new_sentence_flags[idx],
+                    )
+                    total_score = hyp.score + step_scores[idx].item()
+                    if word == GF_EOS:
+                        done.append(
+                            replace(
+                                hyp,
+                                words=list(hyp.words),
+                                score=total_score,
+                                gf_logprob=hyp.gf_logprob + gf_lp,
+                                llm_logprob=hyp.llm_logprob + llm_lp,
+                                finished=True,
+                                past_key_values=None,
+                                next_start_logits=None,
+                            )
+                        )
+                    else:
+                        new_sentence_words = [word] if new_sentence else list(hyp.sentence_words) + [word]
+                        cache, next_start_logits = self._materialize(hyp, word)
+                        sampled_beams.append(
+                            replace(
+                                hyp,
+                                words=list(hyp.words) + [word],
+                                sentence_words=new_sentence_words,
+                                score=total_score,
+                                gf_logprob=hyp.gf_logprob + gf_lp,
+                                llm_logprob=hyp.llm_logprob + llm_lp,
+                                past_key_values=cache,
+                                next_start_logits=next_start_logits,
+                            )
+                        )
+                else:
+                    for word, gf_lp, new_sentence, llm_lp in zip(
+                        words_i, gf_lps, new_sentence_flags, llm_lps
+                    ):
+                        expansions.append(_Expansion(hyp, word, gf_lp, llm_lp, new_sentence))
+
+            if self.do_sample:
+                if n_candidates == 0:
+                    # every live hypothesis's dist was empty (a genuine grammar
+                    # dead end, not "everyone sampled GF_EOS") -- leave `beams`
+                    # untouched rather than overwriting it with the empty
+                    # `sampled_beams`, so the last valid (unfinished) hypotheses
+                    # are still returned instead of losing them to an empty
+                    # `results` (mirrors the pooled path's `if not expansions`
+                    # check below).
+                    if self.verbose:
+                        print(f"[word-step {step_idx:3d}] no live expansions, stopping", flush=True)
+                    break
+                beams = sampled_beams
+                if self.verbose:
+                    print(
+                        f"[word-step {step_idx:3d}] hyps={n_hyps:2d} candidates={n_candidates:5d} "
+                        f"live={len(beams)} done={len(done)}  |  "
+                        f"pgf complete() [parse]: {grammar_s * 1000:7.1f} ms  |  "
+                        f"LLM forward [_score_hyp_candidates]: {llm_s * 1000:8.1f} ms  |  "
+                        f"sample: {select_s * 1000:6.2f} ms  |  "
+                        f"step total: {(time.perf_counter() - step_start) * 1000:8.1f} ms",
+                        flush=True,
+                    )
+                # No early-stop heuristic here: independent chains aren't
+                # optimized against each other the way pooled beam search is
+                # (a currently-low-scoring live chain can still wander into a
+                # good finish), so just run until every chain finishes or
+                # max_words is reached.
+                if not beams:
+                    break
+                continue
+
             if not expansions:
                 if self.verbose:
                     print(f"[word-step {step_idx:3d}] no live expansions, stopping", flush=True)
@@ -382,8 +610,14 @@ class WordBeamSearcher:
             if not beams:
                 break
 
-        done.sort(key=self._normalized_score, reverse=True)
-        results = done or sorted(beams, key=self._normalized_score, reverse=True)
+        # under do_sample, chains are independent (like num_return_sequences),
+        # so a chain finishing before another one is not a reason to drop the
+        # still-running one: report *both* finished and still-live chains,
+        # not just whichever happened to reach GF_EOS first. The deterministic
+        # path keeps its original behavior (only fall back to `beams` when
+        # nothing at all finished), unaffected by this.
+        results = done + beams if self.do_sample else (done or beams)
+        results.sort(key=self._normalized_score, reverse=True)
         return results[: num_return or self.beam_size]
 
     # ------------------------------------------------------------- scoring
@@ -415,6 +649,29 @@ class WordBeamSearcher:
             selected.append(picked)
             word_counts[picked[1].word] = word_counts.get(picked[1].word, 0) + 1
         return selected
+
+    def _sample_index(self, step_scores: torch.Tensor) -> int:
+        """Sample one candidate index from `step_scores` (this hypothesis's
+        fused per-word log-scores), applying temperature then top-k/top-p/
+        min-p/typical-p filtering -- the same cascade order HF's sampling
+        warpers use, just over this step's candidate set instead of the
+        full vocabulary. Only called when `do_sample=True`."""
+        n = step_scores.shape[0]
+        if n <= 1:
+            return 0
+        if self.temperature <= 1e-5:
+            return int(torch.argmax(step_scores).item())
+        logits = step_scores / self.temperature
+        if self.top_k > 0:
+            logits = _filter_top_k(logits, self.top_k)
+        if self.top_p < 1.0:
+            logits = _filter_top_p(logits, self.top_p)
+        if self.min_p > 0.0:
+            logits = _filter_min_p(logits, self.min_p)
+        if self.typical_p < 1.0:
+            logits = _filter_typical_p(logits, self.typical_p)
+        probs = torch.softmax(logits, dim=-1)
+        return int(torch.multinomial(probs, 1, generator=self._generator).item())
 
     def _filter_repeats(
         self,

@@ -7,7 +7,15 @@ import torch
 from transformers import DynamicCache
 
 from gf_gcd.gf_probs import GF_EOS, GFProbRuntime
-from gf_gcd.word_beam import WordBeamSearcher, WordHypothesis, _Expansion
+from gf_gcd.word_beam import (
+    WordBeamSearcher,
+    WordHypothesis,
+    _Expansion,
+    _filter_min_p,
+    _filter_top_k,
+    _filter_top_p,
+    _filter_typical_p,
+)
 
 from .conftest import requires_gf
 
@@ -210,3 +218,150 @@ def test_select_diverse_avoids_two_survivors_with_the_same_word():
     continuations = [(0.0, e_best_x), (-0.1, e_second_x), (-1.0, e_y)]
     survivors = s._select_diverse(continuations)
     assert {e.word for _, e in survivors} == {"x", "y"}
+
+
+# ---------------------------------------------------------------------------
+# Sampling mode (do_sample=True): pure-algorithm tests for the filter
+# cascade and `_sample_index` (bare, no grammar/model needed), plus a few
+# GF-backed tests for end-to-end behavior with the toy Food grammar.
+
+
+def test_filter_top_k_keeps_only_the_k_highest():
+    logits = torch.tensor([1.0, 3.0, 2.0, 0.5, -1.0])
+    kept = torch.isfinite(_filter_top_k(logits, 2))
+    assert kept.tolist() == [False, True, True, False, False]
+
+
+def test_filter_top_p_always_keeps_the_top_candidate():
+    logits = torch.tensor([1.0, 3.0, 2.0, 0.5, -1.0])
+    kept = torch.isfinite(_filter_top_p(logits, 1e-6))  # near-maximal cutoff
+    assert kept[1].item() is True
+    assert kept.sum().item() >= 1
+
+
+def test_filter_min_p_always_keeps_the_top_candidate():
+    logits = torch.tensor([1.0, 3.0, 2.0, 0.5, -1.0])
+    kept = torch.isfinite(_filter_min_p(logits, 0.9))  # aggressive relative cutoff
+    assert kept[1].item() is True
+    assert kept.sum().item() >= 1
+
+
+def test_filter_typical_p_never_empties_the_candidate_set():
+    logits = torch.tensor([1.0, 3.0, 2.0, 0.5, -1.0])
+    assert torch.isfinite(_filter_typical_p(logits, 0.01)).sum().item() >= 1
+
+
+def test_sample_index_near_zero_temperature_is_argmax():
+    s = _bare_searcher(do_sample=True, temperature=1e-8)
+    assert s._sample_index(torch.tensor([1.0, 3.0, 2.0])) == 1
+
+
+def test_sample_index_top_k_1_is_deterministic():
+    s = _bare_searcher(do_sample=True, top_k=1, seed=0)
+    logits = torch.tensor([1.0, 3.0, 2.0])
+    assert all(s._sample_index(logits) == 1 for _ in range(5))
+
+
+def test_do_sample_and_diversity_penalty_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        _bare_searcher(do_sample=True, diversity_penalty=0.5)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"top_p": 1.5},
+        {"top_p": 0.0},
+        {"min_p": -0.1},
+        {"min_p": 1.1},
+        {"typical_p": 0.0},
+        {"typical_p": 1.1},
+        {"temperature": 0.0},
+        {"temperature": -1.0},
+    ],
+)
+def test_invalid_sampling_params_rejected(kwargs):
+    with pytest.raises(ValueError):
+        _bare_searcher(**kwargs)
+
+
+@requires_gf
+def test_do_sample_top_k_1_matches_deterministic_greedy(food_runtime):
+    # top_k=1 collapses each hypothesis's sampling draw to the same per-step
+    # argmax that deterministic beam_size=1 beam search already performs (a
+    # single hypothesis's own top-1 candidate is the same whether it's found
+    # by pooling-then-sorting or by a temperature/top-k-filtered multinomial
+    # draw with k=1) -- this is a regression check that the new selection
+    # path agrees with the existing one in this degenerate case.
+    greedy = make_searcher(food_runtime, lambda_gf=1.0, beam_size=1).search("p", max_words=8)[0]
+    sampled = make_searcher(
+        food_runtime, lambda_gf=1.0, beam_size=1, do_sample=True, top_k=1, seed=0
+    ).search("p", max_words=8)[0]
+    assert sampled.finished
+    assert sampled.text == greedy.text
+
+
+@requires_gf
+def test_do_sample_is_reproducible_with_a_seed(food_runtime):
+    kwargs = dict(lambda_gf=0.3, beam_size=4, do_sample=True, temperature=1.5, seed=42)
+    first = make_searcher(food_runtime, **kwargs).search("p", max_words=8, num_return=4)
+    second = make_searcher(food_runtime, **kwargs).search("p", max_words=8, num_return=4)
+    assert [h.text for h in first] == [h.text for h in second]
+
+
+@requires_gf
+def test_do_sample_beam_size_acts_as_independent_chain_count(food_runtime):
+    n_chains = 3
+    results = make_searcher(
+        food_runtime, lambda_gf=0.3, beam_size=n_chains, do_sample=True, temperature=1.0, seed=1
+    ).search("p", max_words=8, num_return=n_chains)
+    assert 1 <= len(results) <= n_chains
+    assert all(isinstance(h, WordHypothesis) for h in results)
+
+
+@requires_gf
+def test_do_sample_actually_explores_beam_size_independent_chains(food_runtime):
+    # regression test: search() must seed `beam_size` independent starting
+    # hypotheses under do_sample=True, not one hypothesis that (unlike pooled
+    # beam search) can never fan out on its own since each hypothesis only
+    # ever advances by exactly one word per step. Without that seeding, at
+    # most 1 chain -- and therefore at most 1 distinct result -- could ever
+    # exist, no matter how large beam_size is.
+    results = make_searcher(
+        food_runtime,
+        lambda_gf=0.0,
+        beam_size=8,
+        bias={"this": 1.0, "that": 1.0, "wine": 1.0, "cheese": 1.0, "fish": 1.0},
+        do_sample=True,
+        temperature=2.0,
+        seed=0,
+    ).search("p", max_words=8, num_return=8)
+    assert len({h.text for h in results}) > 1
+
+
+class _DeadEndRuntime:
+    """`next_token_logprobs` always returns no legal continuation -- a
+    genuine grammar dead end, distinct from a forced stop (which returns
+    `{GF_EOS: ...}`)."""
+
+    def next_token_logprobs(self, words, pgf_name=None, temperature=1.0):
+        return {}
+
+
+def test_do_sample_all_chains_dead_end_keeps_last_valid_beams():
+    # regression test: if every live chain's grammar continuation is empty in
+    # the same step, `search` must fall back to the last valid hypotheses
+    # instead of overwriting `beams` with the (empty) sampling result and
+    # returning `[]` -- which crashed callers doing `results[0]` (do_sample's
+    # per-step selection only reassigns `beams` unconditionally; the pooled
+    # path avoids this because it never reassigns `beams` when `expansions`
+    # comes back empty).
+    tok = FakeTokenizer(FOOD_WORDS)
+    model = FakeModel(tok.vocab_size)
+    searcher = WordBeamSearcher(
+        model, tok, _DeadEndRuntime(), lambda_gf=0.5, beam_size=3, do_sample=True, seed=0
+    )
+    results = searcher.search("p", max_words=5, num_return=3)
+    assert results
+    assert not results[0].finished
+    assert results[0].words == []  # never advanced past the (dead-end) initial state
