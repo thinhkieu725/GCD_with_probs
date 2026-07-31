@@ -208,6 +208,43 @@ def test_filter_repeats_never_empties_the_candidate_list():
     assert words == ["b"]
 
 
+def test_prune_candidates_noop_by_default():
+    s = _bare_searcher()
+    words, gf_lps, flags = s._prune_candidates(
+        words=["a", "b", GF_EOS], gf_lps=[-0.1, -3.0, -5.0], flags=[False, False, False]
+    )
+    assert words == ["a", "b", GF_EOS]
+
+
+def test_prune_candidates_top_k_keeps_highest_gf_lp():
+    s = _bare_searcher(candidate_top_k=2)
+    words, gf_lps, flags = s._prune_candidates(
+        words=["a", "b", "c"], gf_lps=[-0.1, -5.0, -2.0], flags=[False, False, False]
+    )
+    assert set(words) == {"a", "c"}
+    assert len(words) == len(gf_lps) == len(flags) == 2
+
+
+def test_prune_candidates_always_keeps_gf_eos():
+    s = _bare_searcher(candidate_top_k=1)
+    # GF_EOS is by far the worst-scoring candidate here, but pruning it
+    # would leave the hypothesis with no way to ever stop
+    words, gf_lps, flags = s._prune_candidates(
+        words=["a", "b", GF_EOS], gf_lps=[-0.1, -0.2, -9.0], flags=[False, False, False]
+    )
+    assert GF_EOS in words
+    assert "a" in words  # the one real top-1 candidate
+    assert len(words) == 2
+
+
+def test_prune_candidates_top_p_drops_the_long_tail():
+    s = _bare_searcher(candidate_top_p=0.9)
+    # "a" alone already carries ~95% of the probability mass
+    gf_lps = [math.log(0.95), math.log(0.03), math.log(0.02)]
+    words, _, _ = s._prune_candidates(words=["a", "b", "c"], gf_lps=gf_lps, flags=[False] * 3)
+    assert words == ["a"]
+
+
 def test_select_diverse_avoids_two_survivors_with_the_same_word():
     s = _bare_searcher(beam_size=2, diversity_penalty=5.0)
     h1, h2 = WordHypothesis(), WordHypothesis()

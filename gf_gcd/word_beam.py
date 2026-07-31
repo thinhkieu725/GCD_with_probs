@@ -46,7 +46,7 @@ sentence (`WordHypothesis.sentence_words`), not its whole history
 scratch, so one `search()` call can produce a `max_words`-bounded passage of
 several grammar-conformant sentences. See `WordBeamSearcher.search`.
 
-Three optional knobs make the search itself smarter, independent of the
+Four optional knobs make the search itself smarter, independent of the
 grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
 `WordBeamSearcher.__init__` for details):
 
@@ -58,6 +58,12 @@ grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
   near-identical continuations.
 - `no_repeat_ngram_size` -- blocks candidates that would recreate an n-gram
   already generated earlier in the same hypothesis.
+- `candidate_top_k` / `candidate_top_p` -- cut the grammar's own candidate
+  set down (by `gf_lp` alone) *before* any of it reaches the LM, since a real
+  grammar step can offer hundreds-to-thousands of legal words and every one
+  costs an LM forward pass in `_score_hyp_candidates`, while only
+  `beam_size` ever survive pruning afterwards. `GF_EOS` is always kept
+  regardless, so a hypothesis never loses its only way to stop.
 
 `do_sample=True` switches to a second, independent decoding mode: instead of
 pooling every hypothesis's candidates into one list and keeping the globally
@@ -205,6 +211,8 @@ class WordBeamSearcher:
         length_penalty: float = 0.0,
         diversity_penalty: float = 0.0,
         no_repeat_ngram_size: int = 0,
+        candidate_top_k: int = 0,
+        candidate_top_p: float = 1.0,
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: int = 0,
@@ -248,6 +256,23 @@ class WordBeamSearcher:
                 earlier in the hypothesis's full word history. 0 (default)
                 disables it. Mirrors `transformers`' generation-time
                 `no_repeat_ngram_size`, adapted to whole-word candidates.
+            candidate_top_k / candidate_top_p: cut the grammar's own
+                candidate set down by `gf_lp` alone, *before* any of it is
+                scored by the LM -- the single biggest lever on wall-clock
+                time when a grammar step offers hundreds-to-thousands of
+                legal words, since each one costs an LM forward pass but
+                only `beam_size` ever survive pruning afterwards. Same
+                top-k / nucleus semantics as `top_k`/`top_p` below, just
+                applied earlier and against the grammar's distribution
+                instead of the fused one. 0 / 1.0 (default) disables both,
+                keeping every legal candidate (current behavior). `GF_EOS`
+                is always kept even if pruning would otherwise drop it --
+                without it a hypothesis could never end. A narrow
+                `candidate_top_k`/`candidate_top_p` trades search breadth
+                for speed: it can drop the true top candidate if the LM
+                disagrees strongly with the grammar's own ranking,
+                especially at low `lambda_gf` where the LM's opinion
+                dominates the fused score but plays no part in this filter.
             do_sample: use independent per-hypothesis sampling instead of
                 deterministic beam search (see the module docstring). Under
                 sampling, `beam_size` is repurposed as "number of independent
@@ -295,6 +320,8 @@ class WordBeamSearcher:
                 "search, which do_sample bypasses entirely (each hypothesis samples "
                 "independently, so there is no shared competition to diversify)."
             )
+        if not 0.0 < candidate_top_p <= 1.0:
+            raise ValueError(f"candidate_top_p must be in (0, 1], got {candidate_top_p}")
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}")
         if not 0.0 <= min_p <= 1.0:
@@ -314,6 +341,8 @@ class WordBeamSearcher:
         self.length_penalty = length_penalty
         self.diversity_penalty = diversity_penalty
         self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.candidate_top_k = candidate_top_k
+        self.candidate_top_p = candidate_top_p
         self.do_sample = do_sample
         self.temperature = temperature
         self.top_k = top_k
@@ -425,6 +454,11 @@ class WordBeamSearcher:
                         words_i.append(word)
                         gf_lps.append(stop_lp + start_lp)
                         new_sentence_flags.append(True)
+
+                if self.candidate_top_k > 0 or self.candidate_top_p < 1.0:
+                    words_i, gf_lps, new_sentence_flags = self._prune_candidates(
+                        words_i, gf_lps, new_sentence_flags
+                    )
 
                 if self.no_repeat_ngram_size > 0:
                     words_i, gf_lps, new_sentence_flags = self._filter_repeats(
@@ -672,6 +706,36 @@ class WordBeamSearcher:
             logits = _filter_typical_p(logits, self.typical_p)
         probs = torch.softmax(logits, dim=-1)
         return int(torch.multinomial(probs, 1, generator=self._generator).item())
+
+    def _prune_candidates(
+        self,
+        words: List[str],
+        gf_lps: List[float],
+        flags: List[bool],
+    ) -> Tuple[List[str], List[float], List[bool]]:
+        """Cut this step's grammar-offered candidate set down by `gf_lp`
+        alone, via `candidate_top_k`/`candidate_top_p`, before any of it is
+        scored by the LM. `GF_EOS` is always kept, even when it would
+        otherwise be pruned -- see `candidate_top_k`'s docstring.
+
+        `gf_lps` are already `next_token_logprobs`'s log-probabilities,
+        normalized over this step's full candidate set, so they can be fed
+        to `_filter_top_k`/`_filter_top_p` (the `do_sample` warpers) as-is:
+        softmax of an already-normalized log-distribution just recovers it.
+        """
+        eos_idx = words.index(GF_EOS) if GF_EOS in words else None
+        logits = torch.tensor(gf_lps, dtype=torch.float32)
+        if self.candidate_top_k > 0:
+            logits = _filter_top_k(logits, self.candidate_top_k)
+        if self.candidate_top_p < 1.0:
+            logits = _filter_top_p(logits, self.candidate_top_p)
+        keep = torch.isfinite(logits)
+        if eos_idx is not None:
+            keep[eos_idx] = True
+        if bool(keep.all()):
+            return words, gf_lps, flags
+        idx = keep.nonzero(as_tuple=True)[0].tolist()
+        return [words[i] for i in idx], [gf_lps[i] for i in idx], [flags[i] for i in idx]
 
     def _filter_repeats(
         self,
