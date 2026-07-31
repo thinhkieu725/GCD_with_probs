@@ -22,6 +22,8 @@ from .conftest import requires_gf
 FOOD_WORDS = [
     "p", "this", "that", "wine", "cheese", "fish", "is", "very",
     "fresh", "warm", "Italian", "expensive", "delicious", "boring",
+    ".", "?", "!",  # sentence-terminal marks: not grammar words, but the LM
+    # must be able to score/encode them (see WordBeamSearcher._SENTENCE_END_MARKS)
 ]
 
 
@@ -154,6 +156,138 @@ def test_search_can_chain_multiple_sentences(food_runtime):
     assert best_chain.sentence_words.count("is") == 1
     assert best_chain.words[-len(best_chain.sentence_words) :] == best_chain.sentence_words
     assert best_chain.sentence_words != best_chain.words
+
+
+# ---------------------------------------------------------------------------
+# Sentence-terminal punctuation (`_SENTENCE_END_MARKS`): the grammar has no
+# productions for "." "?" "!" at all (see module docstring for why), so these
+# tests exercise the LM-only escape hatch `search` offers whenever a legal
+# stop exists, and its interaction with `sentence_words` resetting so a
+# hypothesis can still chain into another sentence afterward.
+
+
+@requires_gf
+def test_punctuation_offered_and_chosen_when_lm_prefers_it(food_runtime):
+    # a huge bias on "." makes it the obvious choice the moment the grammar
+    # says stopping is legal (here: a forced stop, "this wine is delicious");
+    # wide beam/return so the (necessarily longer, hence lower-scoring under
+    # length_penalty=0) punctuated completions aren't cut by num_return
+    # before we get to inspect one
+    searcher = make_searcher(food_runtime, lambda_gf=0.3, bias={".": 20.0}, beam_size=64)
+    results = searcher.search("p", max_words=8, num_return=64)
+    closed = [h for h in results if "." in h.words]
+    assert closed, "expected at least one hypothesis to close with '.'"
+    hyp = closed[0]
+    # the mark closes the sentence: it's the last word of `words` but is not
+    # part of `sentence_words` (which resets to [] right after it)
+    assert hyp.words[-1] == "."
+    assert hyp.sentence_words == []
+
+
+class _OptionalStopRuntime:
+    """Fake runtime whose sentence can *optionally* end at any length >= 1:
+    every step offers both GF_EOS and a live continuation ("more"), a shape
+    the toy Food grammar (forced stops only) cannot produce on its own."""
+
+    def next_token_logprobs(self, words, pgf_name=None, temperature=1.0):
+        if not words:
+            return {"more": math.log(1.0)}  # must start with a real word
+        return {GF_EOS: math.log(0.5), "more": math.log(0.5)}
+
+
+def test_punctuation_step_score_ignores_lambda_gf():
+    # isolates the one property `lambda_gf` must never touch: the score
+    # contributed by *emitting* a sentence-end mark (and by stopping right
+    # after one). Both are `gf_free` (see word_beam.py) with a hardcoded
+    # gf_lp=0.0 bookkeeping value -- so a hypothesis that closes with "."
+    # and then stops has `gf_logprob == 0.0` regardless of lambda_gf (its
+    # one grammar-priced step, "more" starting the sentence, also happens to
+    # have gf_lp=0.0 here: it's the only legal first word). If `search`
+    # blended these `gf_free` steps instead of bypassing lambda_gf for them,
+    # `score` at lambda_gf=1.0 would come out to exactly `gf_logprob` (0.0),
+    # the same degenerate result as a *fully* grammar-priced hypothesis
+    # (`test_pure_grammar_follows_probs_file`) -- discarding the marks' real
+    # (and here, clearly unfavorable) LM cost entirely.
+    tok = FakeTokenizer(["p", "more", ".", "?", "!"])  # "more": _OptionalStopRuntime's only word
+    bias = {".": 6.0, "!": -3.0}  # distinct, non-degenerate logits per mark
+    model = FakeModel(tok.vocab_size, {tok.vocab[w]: v for w, v in bias.items()})
+    searcher = WordBeamSearcher(model, tok, _OptionalStopRuntime(), lambda_gf=1.0, beam_size=8)
+
+    results = searcher.search("p", max_words=3, num_return=8)
+    hyp = next(h for h in results if h.words == ["more", "."])
+    assert hyp.gf_logprob == pytest.approx(0.0)
+    assert hyp.score < -0.01  # not the degenerate 0.0 a naive blend would give
+
+
+@requires_gf
+def test_punctuation_can_chain_into_another_sentence(food_runtime):
+    # after closing with ".", the hypothesis should still be able to start a
+    # brand new Comment rather than being forced to stop right there
+    searcher = make_searcher(food_runtime, lambda_gf=1.0, beam_size=64, bias={".": 5.0})
+    results = searcher.search("p", max_words=12, num_return=64)
+    chained = [h for h in results if h.finished and h.words.count(".") >= 1 and h.words.count("is") > 1]
+    assert chained, "expected a hypothesis that closed a sentence with '.' and then chained another"
+    hyp = chained[0]
+    # exactly one "." should appear before the final (unterminated by a mark,
+    # since generation can also end via plain GF_EOS) or terminated sentence
+    dot_idx = hyp.words.index(".")
+    assert hyp.words[dot_idx] == "."
+    # everything after the mark belongs to a fresh sentence: "is" appears
+    # again after it
+    assert "is" in hyp.words[dot_idx + 1 :]
+
+
+class _SpaceSensitiveTokenizer:
+    """Unlike `FakeTokenizer` (which `.split()`s and so can't distinguish a
+    leading space), maps the exact encoded string to an id -- " wine" and
+    "wine" are different tokens, like a real BPE tokenizer's are."""
+
+    def __init__(self, words):
+        surface = [w for word in words for w in (word, " " + word)]
+        self.vocab = {s: i + 1 for i, s in enumerate(dict.fromkeys(surface))}
+        self.eos_token_id = 0
+
+    def encode(self, text, add_special_tokens=True):
+        return [self.vocab[text]]
+
+
+def test_candidate_ids_punctuation_has_no_leading_space():
+    tok = _SpaceSensitiveTokenizer(["wine", ".", "?", "!"])
+    model = FakeModel(len(tok.vocab) + 1)
+    searcher = WordBeamSearcher(model, tok, runtime=None, prefix_space=True)
+    # ordinary mid-sentence words get the leading-space form ("cat" -> " cat")
+    assert searcher._candidate_ids("wine") == [tok.vocab[" wine"]]
+    # sentence-terminal marks attach directly, with no leading space at all
+    assert searcher._candidate_ids(".") == [tok.vocab["."]]
+    assert searcher._candidate_ids("?") == [tok.vocab["?"]]
+    assert searcher._candidate_ids("!") == [tok.vocab["!"]]
+
+
+def test_hypothesis_text_has_no_space_before_punctuation():
+    # `_candidate_ids` feeding the LM a space-less token for "." "?" "!" only
+    # controls what the *model* sees; `WordHypothesis.text` reconstructs the
+    # displayed string from `words` independently (`" ".join` would put a
+    # space before every word, punctuation included) and must mark the same
+    # marks as exceptions, or the rendered text still comes out "cat ." even
+    # though the model was scored on "cat.".
+    hyp = WordHypothesis(words=["this", "wine", "is", "delicious", ".", "is", "it", "fresh", "?"])
+    assert hyp.text == "this wine is delicious. is it fresh?"
+
+
+def test_punctuation_offered_at_an_optional_stop_not_just_forced():
+    # regression test: `_SENTENCE_END_MARKS` must be offered any time GF_EOS
+    # is *one of* the legal continuations, not only when it's the *only* one
+    tok = FakeTokenizer(["p", "more", ".", "?", "!"])
+    bias = {".": 20.0}  # overwhelm "more" so the searcher takes the mark
+    model = FakeModel(tok.vocab_size, {tok.vocab[w]: v for w, v in bias.items()})
+    searcher = WordBeamSearcher(
+        model, tok, _OptionalStopRuntime(), lambda_gf=0.3, beam_size=8
+    )
+    results = searcher.search("p", max_words=4, num_return=8)
+    assert any("." in h.words for h in results), (
+        "expected '.' to be offered (and chosen) at an optional stop, "
+        "where GF_EOS is legal but not the only continuation"
+    )
 
 
 # ---------------------------------------------------------------------------

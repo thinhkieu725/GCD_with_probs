@@ -107,7 +107,7 @@ SAMPLE_SEED = None         # set an int for reproducible sampling runs
 
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
 BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
-SHOW_TIMER = True  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
+SHOW_TIMER = False  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
 
 # ============================================================= /CONFIG =====
 
@@ -152,9 +152,25 @@ def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, pro
     display_beam_size = BEAM_SIZE if DECODING_MODE == "beam" else SAMPLE_NUM_CHAINS
 
     if INCLUDE_BASELINE_WITHOUT_CONSTRAINT:
-        print(f"baseline (no grammar fusion, num_beams={display_beam_size}):")
+        if DECODING_MODE == "beam":
+            print(f"baseline (no grammar fusion, num_beams={display_beam_size}):")
+            baseline_kwargs = dict(num_beams=display_beam_size)
+        else:
+            # match WordBeamSearcher's sampling mode below, so the baseline
+            # is a fair comparison instead of silently falling back to beam
+            # search while the constrained side samples
+            print("baseline (no grammar fusion, do_sample=True):")
+            baseline_kwargs = dict(
+                do_sample=True,
+                temperature=SAMPLE_TEMPERATURE,
+                top_k=SAMPLE_TOP_K,
+                top_p=SAMPLE_TOP_P,
+                min_p=SAMPLE_MIN_P,
+                typical_p=SAMPLE_TYPICAL_P,
+                seed=SAMPLE_SEED,
+            )
         result = generator.generate(
-            prompt, constraint=None, max_new_tokens=BASELINE_MAX_NEW_TOKENS, num_beams=display_beam_size
+            prompt, constraint=None, max_new_tokens=BASELINE_MAX_NEW_TOKENS, **baseline_kwargs
         )
         print(f"  unconstrained  ->  {result.first_texts[0]!r}")
 
