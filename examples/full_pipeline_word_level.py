@@ -65,7 +65,8 @@ GF_BINARY = "gf"
 # Stage 4/5 — model + decoding
 # Device/quantization setup below is CUDA-specific — see docs/device_setup.md
 # for what to change to run on CPU-only or Apple Silicon (mps) instead.
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ungated on HF; alternative: "meta-llama/Llama-3.1-8B-Instruct" (gated, needs HF token + accepted license)
+# MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ungated on HF; alternative: "meta-llama/Llama-3.1-8B-Instruct" (gated, needs HF token + accepted license)
+MODEL_NAME = "Qwen/Qwen2.5-7B"
 DEVICE_MAP = "cuda"       # single-GPU placement; requires `accelerate`
 HALF_PRECISION = True     # float16 for the non-quantized layers (embeddings, norms)
 QUANTIZATION_CONFIG = BitsAndBytesConfig(
@@ -74,7 +75,7 @@ QUANTIZATION_CONFIG = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_use_double_quant=True,
 )  # requires `bitsandbytes`; keeps a 7-8B model comfortably under 12GB VRAM
-LAMBDAS = [0.0, 0.1, 0.3, 1.0]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
 MAX_WORDS = 40              # ditto
@@ -203,7 +204,7 @@ def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, pro
         hyps = searcher.search(prompt, max_words=MAX_WORDS, num_return=NUM_RETURN)
         best = hyps[0]
         print(
-            f"  lambda={lam:4.1f}  ->  {best.text!r}   "
+            f"  lambda={lam:4.3f}  ->  {best.text!r}   "
             f"(gf={best.gf_logprob:6.2f}, lm={best.llm_logprob:7.2f})"
         )
 

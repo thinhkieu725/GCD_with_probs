@@ -41,10 +41,14 @@ scale roughly quadratically with `max_words`.
 The grammar itself only ever accepts *one* sentence, though, so the words
 proposed at each step are the continuations of the hypothesis's current
 sentence (`WordHypothesis.sentence_words`), not its whole history
-(`WordHypothesis.words`). Once a sentence has no legal continuation left,
-`search` forks it into ending there or starting another sentence from
-scratch, so one `search()` call can produce a `max_words`-bounded passage of
-several grammar-conformant sentences. See `WordBeamSearcher.search`.
+(`WordHypothesis.words`). `GF_EOS` -- the grammar's signal that the current
+sentence's derivation is already complete -- is therefore an *end-of-sentence*
+marker, not an end-of-*sequence* one: it never appears as a candidate word in
+its own right, and picking it never ends a hypothesis outright. Once a
+sentence has no legal continuation left, `search` forks it into closing the
+sentence or starting another one from scratch, so one `search()` call can
+produce a `max_words`-bounded passage of several grammar-conformant
+sentences. See `WordBeamSearcher.search`.
 
 Sentence-terminal punctuation ("." "?" "!") is deliberately *not* part of the
 grammar: an earlier attempt at adding it as real grammar productions (a
@@ -53,16 +57,47 @@ new functions with no calibrated probability -- the treebank-estimated
 `.probs` file predates them, so the grammar would have had to guess at
 P(. | ? | !) instead of reflecting real usage. Instead, whenever a
 hypothesis's current sentence has a legal stop at all (`GF_EOS` offered by
-the grammar, forced or merely optional), `search` also offers closing it
-with one of `_SENTENCE_END_MARKS`, priced *purely* by the LM's own
-log-probability for that mark (`_Expansion.gf_free`, see `_score_hyp_candidates`)
--- the grammar has no opinion on which mark fits, so `lambda_gf` never
-touches this choice. Picking one resets `sentence_words` to `[]` (the mark
-belongs to the sentence just closed, not the next one) without ending the
-hypothesis outright: the following step scores both the grammar's fresh
-start-of-sentence words (another sentence) and, from `next_start_logits`
-(no extra forward pass needed, already conditioned on having just emitted
-the mark), stopping generation for real right there.
+the grammar, forced or merely optional), `search` offers closing it with one
+of `_SENTENCE_END_MARKS`, each priced with the grammar's own belief that
+stopping is licensed here (`GF_EOS`'s own cost, the *same* value for all
+three marks -- the grammar has no opinion on *which* mark fits) blended
+against that mark's own LM log-probability by `lambda_gf`, exactly like an
+ordinary word. Picking one resets `sentence_words` to `[]` (the mark belongs
+to the sentence just closed, not the next one) without ending the hypothesis
+outright: the following step scores both the grammar's fresh start-of-sentence
+words (another sentence) and, from `next_start_logits` (no extra forward pass
+needed, already conditioned on having just emitted the mark), stopping the
+whole answer for real right there -- priced *purely* by the LM
+(`_Expansion.gf_free`, see `_score_hyp_candidates`), since the grammar only
+ever describes one sentence and has nothing to say about when a
+multi-sentence answer as a whole is done.
+
+That "stop the whole answer" decision is *not* folded into the usual pooled
+`beam_size` competition, though: doing so would let a short first sentence
+win purely by being the first hypothesis to offer stopping at all, before any
+longer, better continuation has had a chance to be generated and compared.
+Instead, deterministic search (`do_sample=False`) settles it per hypothesis,
+on the spot, as a small local decision: the real `eos_token_id`'s raw LM
+log-probability is compared directly against the LM's own raw log-probability
+for each of the grammar's legal opening words for a fresh sentence -- no
+`lambda_gf` blending on either side, since the grammar has an opinion on
+neither. If `eos` wins that comparison the hypothesis is finished right there;
+otherwise it simply continues, competing for a `beam_size` slot via the usual
+pooled fusion like any other step. `length_penalty` still has a say: the
+comparison divides `eos`'s log-prob by `_length_norm` (the same GNMT-style
+factor `_normalized_score` uses) -- essentially 1 (no help) right after the
+very first sentence and growing from there, softening `eos`'s cost as the
+hypothesis runs on longer -- so a positive `length_penalty` discourages
+stopping early without discouraging it forever, and is a pure no-op at
+`length_penalty=0` (`_length_norm` is always exactly 1 then). See the `else`
+branch of the per-hypothesis loop in `WordBeamSearcher.search`.
+
+Under `do_sample=True`, this decision isn't singled out at all: "stop the
+whole answer" is just one more candidate in that hypothesis's own draw (see
+below), never automatically banked and never gated against the alternatives
+first -- independent chains aren't compared against each other the way pooled
+hypotheses are, so there's no "shortest one wins by default" failure mode to
+guard against there.
 
 Four optional knobs make the search itself smarter, independent of the
 grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
@@ -80,8 +115,9 @@ grammar/LM tradeoff `lambda_gf` controls (see their docstrings in
   set down (by `gf_lp` alone) *before* any of it reaches the LM, since a real
   grammar step can offer hundreds-to-thousands of legal words and every one
   costs an LM forward pass in `_score_hyp_candidates`, while only
-  `beam_size` ever survive pruning afterwards. `GF_EOS` is always kept
-  regardless, so a hypothesis never loses its only way to stop.
+  `beam_size` ever survive pruning afterwards. The sentence-end marks and the
+  "stop the whole answer" option are added back in *after* this cut, so a
+  hypothesis never loses its only way to stop.
 
 `do_sample=True` switches to a second, independent decoding mode: instead of
 pooling every hypothesis's candidates into one list and keeping the globally
@@ -92,8 +128,9 @@ temperature/top-k/top-p/min-p/typical-p-filtered distribution -- the same
 `transformers.generate()`, just hand-rolled over grammar words instead of LM
 tokens. It does not reuse the pooled top-`beam_size` cut at all: hypotheses
 never compete with each other, `diversity_penalty` (which only makes sense
-for that pooled competition) is rejected alongside it, and `GF_EOS` is just
-another candidate in the draw rather than an automatic, uncontested survivor.
+for that pooled competition) is rejected alongside it, and the "stop the
+whole answer" option is just another candidate in the draw rather than an
+automatic, uncontested survivor.
 See `WordBeamSearcher._sample_index` and the `do_sample` argument docstring.
 """
 
@@ -134,10 +171,16 @@ class WordHypothesis:
     @property
     def text(self) -> str:
         parts: List[str] = []
+        start_of_sentence = True  # every grammar terminal is lowercase (bar
+        # hardcoded exceptions like "I"), so the first word of each sentence
+        # -- here and right after a `_SENTENCE_END_MARKS` mark -- needs its
+        # own capitalization; mid-sentence words are rendered as-is.
         for word in self.words:
             if parts and word not in _SENTENCE_END_MARKS:
                 parts.append(" ")
-            parts.append(word)
+            display = word[0].upper() + word[1:] if start_of_sentence and word else word
+            parts.append(display)
+            start_of_sentence = word in _SENTENCE_END_MARKS
         return "".join(parts)
 
 
@@ -154,10 +197,6 @@ class _Expansion:
     word: str
     gf_lp: float
     llm_lp: float
-    # True when `word` begins a *new* sentence (offered because the
-    # hypothesis's current sentence had no legal continuation left), rather
-    # than continuing `hyp.sentence_words`.
-    new_sentence: bool = False
     # True when `word` is one of `WordBeamSearcher._SENTENCE_END_MARKS`,
     # closing the current sentence: on survival, `sentence_words` resets to
     # `[]` (the mark belongs to the finished sentence, not the next one)
@@ -281,14 +320,20 @@ class WordBeamSearcher:
                 out of GPU memory on a step with many legal candidates;
                 raise it for more throughput if memory allows.
             length_penalty: GNMT-style length-normalization exponent, applied
-                only when *comparing* hypotheses that may have a different
-                number of words (finished-vs-live early stopping, and the
-                final ranking of `done`) — never when picking survivors
-                within a single step, since those are always the same length.
-                Raw cumulative log-probs get more negative every extra word,
+                when *comparing* hypotheses that may have a different number
+                of words (finished-vs-live early stopping, and the final
+                ranking of results) — never when picking survivors within a
+                single step, since those are always the same length. Raw
+                cumulative log-probs get more negative every extra word,
                 which biases those comparisons toward whichever hypothesis
                 happened to finish first; 0.0 (default) reproduces that raw
-                behavior, ~0.6-1.0 corrects for it.
+                behavior, ~0.6-1.0 corrects for it. Also biases the
+                deterministic (`do_sample=False`) "stop the whole answer"
+                gate right after a sentence-end mark (see module docstring):
+                a positive value makes that gate harder to win the sooner it's
+                offered, tapering off as the hypothesis runs on longer, so a
+                short first sentence isn't reflexively favored just for being
+                first in line to close.
             diversity_penalty: when selecting the `beam_size` survivors of a
                 step, each candidate word already claimed by a higher-ranked
                 survivor *this step* has this much subtracted from its score
@@ -311,9 +356,10 @@ class WordBeamSearcher:
                 top-k / nucleus semantics as `top_k`/`top_p` below, just
                 applied earlier and against the grammar's distribution
                 instead of the fused one. 0 / 1.0 (default) disables both,
-                keeping every legal candidate (current behavior). `GF_EOS`
-                is always kept even if pruning would otherwise drop it --
-                without it a hypothesis could never end. A narrow
+                keeping every legal candidate (current behavior). The
+                sentence-end marks and the "stop the whole answer" option are
+                added back in after this cut, so a hypothesis never loses its
+                only way to stop. A narrow
                 `candidate_top_k`/`candidate_top_p` trades search breadth
                 for speed: it can drop the true top candidate if the LM
                 disagrees strongly with the grammar's own ranking,
@@ -406,35 +452,37 @@ class WordBeamSearcher:
         pgf_name: Optional[str] = None,
         num_return: Optional[int] = None,
     ) -> List[WordHypothesis]:
-        """Return finished hypotheses, best fused score first.
+        """Return hypotheses, best (length-normalized) fused score first.
 
         The grammar accepts exactly one sentence, so each hypothesis is
         proposed continuations of its *current* sentence only
-        (`hyp.sentence_words`), not its whole `words` history. Whenever that
-        current sentence has no legal continuation left (`GF_EOS` is the
-        *only* candidate the grammar offers), the hypothesis forks: one
-        branch ends there (`GF_EOS` consumed, moved to `done`, scored via
-        the real EOS token like today), and one branch per legal
-        start-of-sentence word begins another sentence (`sentence_words`
-        reset to `[word]`, `words` keeps growing) -- so a single `search()`
-        call can produce a multi-sentence `max_words`-bounded passage of
+        (`hyp.sentence_words`), not its whole `words` history. Whenever the
+        grammar signals that current sentence's derivation is already
+        complete (`GF_EOS`, forced if it's the *only* candidate offered, or
+        merely optional alongside live continuations), that signal is spent
+        pricing the three `_SENTENCE_END_MARKS` ("." "?" "!") -- `GF_EOS`
+        itself never becomes an output token (see module docstring) -- each
+        blended against its own LM score by `lambda_gf` and competing for a
+        `beam_size` slot exactly like an ordinary word. Choosing one resets
+        `sentence_words` to `[]` (the mark belongs to the sentence just
+        closed) but keeps the hypothesis live, so a single `search()` call
+        can produce a multi-sentence `max_words`-bounded passage of
         grammar-conformant sentences, not just one.
 
-        Separately -- and regardless of whether the stop is forced or
-        merely optional (`GF_EOS` alongside live continuations) -- any
-        legal stop also offers closing the current sentence with one of
-        `_SENTENCE_END_MARKS` ("." "?" "!"), priced purely by the LM (see
-        module docstring). Choosing one resets `sentence_words` to `[]`
-        (the mark belongs to the sentence just closed) but keeps the
-        hypothesis live; the *next* step then scores both a fresh sentence
-        and, from `next_start_logits`, actually stopping generation right
-        there. This is what lets an optional stop end a sentence with real
-        punctuation instead of only ever competing with its own live
-        continuations for the whole hypothesis.
+        The step right after a mark closes a sentence then settles, per
+        hypothesis, whether to stop the whole answer there or start another
+        sentence -- a local, LM-only decision (`lambda_gf`-blind either way,
+        the grammar has no opinion on it), *not* an automatic, uncontested
+        `done` entry: see the module docstring's "stop the whole answer"
+        paragraph for exactly how that comparison works and how
+        `length_penalty` factors into it under deterministic search.
 
-        Hypotheses that hit `max_words` without the grammar allowing an end
-        are dropped; if *nothing* finishes, the best partial hypotheses are
-        returned with `finished=False` so callers can inspect what happened.
+        A hypothesis that hits `max_words` without ever stopping, or that
+        runs into a genuine grammar dead end, is still reported: `results`
+        merges every finished hypothesis with whatever's still live and
+        ranks all of them by length-normalized score, so a longer live
+        hypothesis can outrank a shorter finished one. Live hypotheses come
+        back with `finished=False` so callers can tell the two apart.
         """
         device = next(self.model.parameters()).device
         prompt_ids = torch.tensor([self.tokenizer.encode(prompt)], device=device)
@@ -479,6 +527,13 @@ class WordBeamSearcher:
             expansions: List[_Expansion] = []  # pooled path (do_sample=False) only
             sampled_beams: List[WordHypothesis] = []  # sampling path (do_sample=True) only
             select_s = 0.0  # sampling path only: time spent drawing each hypothesis's next word
+            # pooled path only: how many hypotheses this step's "stop the
+            # whole answer" gate settled directly into `done`, bypassing
+            # `expansions` entirely -- needed below to tell "every live
+            # hypothesis finished via the gate" (real progress) apart from
+            # "nothing at all happened" (a genuine dead end), since both
+            # leave `expansions` empty.
+            n_gated_done = 0
             for hyp in beams:
                 t0 = time.perf_counter()
                 dist = self.runtime.next_token_logprobs(
@@ -488,83 +543,86 @@ class WordBeamSearcher:
 
                 words_i: List[str] = []
                 gf_lps: List[float] = []
-                new_sentence_flags: List[bool] = []
                 # candidates the grammar has no opinion on at all (sentence-
-                # end marks, and "stop right after just closing one" below):
-                # gathered separately so pruning/repeat-filtering -- which
-                # only make sense for the grammar's own candidates -- never
-                # touch them; merged back in just before LM scoring.
+                # end marks, and "stop the whole answer" below): gathered
+                # separately so pruning/repeat-filtering -- which only make
+                # sense for the grammar's own candidates -- never touch them;
+                # merged back in just before LM scoring.
                 free_words: List[str] = []
                 free_gf_lps: List[float] = []
                 free_sentence_end: List[bool] = []
+                free_gf_free: List[bool] = []
 
-                if dist:
-                    words_i = list(dist.keys())
-                    gf_lps = list(dist.values())
-                    new_sentence_flags = [False] * len(words_i)
+                # `GF_EOS`'s cost, when the grammar offers it, is never itself
+                # a candidate word -- it's an end-of-*sentence* signal, not an
+                # end-of-sequence one (see module docstring) -- so it's pulled
+                # out here and reused below to price the sentence-end marks.
+                stop_lp: Optional[float] = None
+                for token, lp in dist.items():
+                    if token == GF_EOS:
+                        stop_lp = lp
+                        continue
+                    words_i.append(token)
+                    gf_lps.append(lp)
 
-                    if GF_EOS in dist:
-                        if set(dist) == {GF_EOS}:
-                            # current sentence has no legal continuation left:
-                            # also offer starting a fresh sentence, in addition
-                            # to (and scored independently of) ending the
-                            # hypothesis here
-                            stop_lp = dist[GF_EOS]
-                            t0 = time.perf_counter()
-                            start_dist = self.runtime.next_token_logprobs(
-                                [], pgf_name=pgf_name, temperature=self.gf_temperature
-                            )
-                            grammar_s += time.perf_counter() - t0
-                            for word, start_lp in start_dist.items():
-                                if word == GF_EOS:
-                                    continue  # an empty sentence isn't a real continuation
-                                words_i.append(word)
-                                gf_lps.append(stop_lp + start_lp)
-                                new_sentence_flags.append(True)
-
-                        # any legal stop (forced or merely optional) can also
-                        # close the sentence with real punctuation instead --
-                        # the grammar has no notion of which mark fits, so
-                        # these are priced purely by the LM (see module
-                        # docstring), never pruned/repeat-filtered away
-                        for mark in self._SENTENCE_END_MARKS:
-                            free_words.append(mark)
-                            free_gf_lps.append(0.0)
-                            free_sentence_end.append(True)
+                if stop_lp is not None:
+                    # the current sentence's derivation is complete (forced,
+                    # if no other candidate came out of `dist` above, or
+                    # merely optional otherwise) -- closing it always goes
+                    # through one of `_SENTENCE_END_MARKS`, since the grammar
+                    # has no productions for punctuation at all. Each mark
+                    # inherits the grammar's own belief that stopping is
+                    # licensed here (`stop_lp`, the same value for all three
+                    # -- the grammar has no opinion on *which* mark fits),
+                    # blended against that mark's own LM score by `lambda_gf`
+                    # exactly like an ordinary word; never pruned/repeat-
+                    # filtered away, since pruning is scored against the
+                    # grammar's own candidate set and these marks aren't part
+                    # of it.
+                    for mark in self._SENTENCE_END_MARKS:
+                        free_words.append(mark)
+                        free_gf_lps.append(stop_lp)
+                        free_sentence_end.append(True)
+                        free_gf_free.append(False)
 
                 if not hyp.sentence_words and hyp.words:
                     # this hypothesis just closed a sentence with punctuation
                     # last step (the only way `sentence_words` is empty while
                     # `words` isn't) -- besides continuing into a fresh
-                    # sentence (`dist` above), it may also just stop here,
-                    # scored from `next_start_logits` (already conditioned on
-                    # having just emitted that mark, no extra forward pass)
+                    # sentence (`dist` above), it may also stop the whole
+                    # answer here. The grammar only ever describes a single
+                    # sentence, so it has nothing to say about *this*
+                    # decision either -- priced purely by the LM, from
+                    # `next_start_logits` (already conditioned on having just
+                    # emitted that mark, no extra forward pass needed).
                     free_words.append(GF_EOS)
                     free_gf_lps.append(0.0)
                     free_sentence_end.append(False)
+                    free_gf_free.append(True)
 
                 if self.candidate_top_k > 0 or self.candidate_top_p < 1.0:
-                    words_i, gf_lps, new_sentence_flags = self._prune_candidates(
-                        words_i, gf_lps, new_sentence_flags
+                    words_i, gf_lps, _ = self._prune_candidates(
+                        words_i, gf_lps, [False] * len(words_i)
                     )
 
                 if self.no_repeat_ngram_size > 0:
-                    words_i, gf_lps, new_sentence_flags = self._filter_repeats(
-                        hyp.words, words_i, gf_lps, new_sentence_flags
+                    words_i, gf_lps, _ = self._filter_repeats(
+                        hyp.words, words_i, gf_lps, [False] * len(words_i)
                     )
 
                 n_grammar = len(words_i)
                 words_i = words_i + free_words
                 gf_lps = gf_lps + free_gf_lps
-                new_sentence_flags = new_sentence_flags + [False] * len(free_words)
                 sentence_end_flags = [False] * n_grammar + free_sentence_end
-                gf_free_flags = [False] * n_grammar + [True] * len(free_words)
+                gf_free_flags = [False] * n_grammar + free_gf_free
 
                 if not words_i:
                     continue
 
                 t0 = time.perf_counter()
-                llm_lps = self._score_hyp_candidates(hyp, words_i)
+                # `hyp.sentence_words` empty means `words_i` are candidates for
+                # the first word of a (new) sentence -- see `_candidate_ids`.
+                llm_lps = self._score_hyp_candidates(hyp, words_i, capitalize=not hyp.sentence_words)
                 llm_s += time.perf_counter() - t0
                 n_candidates += len(words_i)
 
@@ -584,11 +642,10 @@ class WordBeamSearcher:
                     )
                     idx = self._sample_index(step_scores)
                     select_s += time.perf_counter() - t0
-                    word, gf_lp, llm_lp, new_sentence, sentence_end = (
+                    word, gf_lp, llm_lp, sentence_end = (
                         words_i[idx],
                         gf_lps[idx],
                         llm_lps[idx],
-                        new_sentence_flags[idx],
                         sentence_end_flags[idx],
                     )
                     total_score = hyp.score + step_scores[idx].item()
@@ -607,11 +664,11 @@ class WordBeamSearcher:
                         )
                     else:
                         new_sentence_words = (
-                            [] if sentence_end
-                            else [word] if new_sentence
-                            else list(hyp.sentence_words) + [word]
+                            [] if sentence_end else list(hyp.sentence_words) + [word]
                         )
-                        cache, next_start_logits = self._materialize(hyp, word)
+                        cache, next_start_logits = self._materialize(
+                            hyp, word, capitalize=not hyp.sentence_words
+                        )
                         sampled_beams.append(
                             replace(
                                 hyp,
@@ -625,11 +682,67 @@ class WordBeamSearcher:
                             )
                         )
                 else:
-                    for word, gf_lp, new_sentence, sentence_end, gf_free, llm_lp in zip(
-                        words_i, gf_lps, new_sentence_flags, sentence_end_flags, gf_free_flags, llm_lps
+                    if GF_EOS in words_i:
+                        # the "stop the whole answer" decision right after a
+                        # mark: the grammar has nothing to say about it (see
+                        # module docstring), so -- like a single independent
+                        # sampling draw -- it's settled here by comparing raw
+                        # LM log-probs alone against the LM's own preference
+                        # among the alternative (starting a fresh sentence
+                        # with each of the grammar's legal opening words),
+                        # rather than the usual lambda_gf-blended fusion, and
+                        # rather than banking it into `done` unconditionally
+                        # regardless of score -- which is what made a short
+                        # first sentence "win" purely by being first to offer
+                        # this choice, no matter how a longer continuation
+                        # would have scored.
+                        #
+                        # `length_penalty` still gets a say here: dividing by
+                        # `_length_norm` is essentially 1 (no help) right
+                        # after the very first sentence and grows the
+                        # effective eos score towards 0 (i.e. more
+                        # attractive) the longer the hypothesis has already
+                        # run, mirroring how it rewards longer sequences in
+                        # `_normalized_score` -- so a positive length_penalty
+                        # discourages stopping right after the very first
+                        # sentence without discouraging it forever, and this
+                        # is a pure no-op when length_penalty=0 (`_length_norm`
+                        # always returns 1.0).
+                        eos_idx = words_i.index(GF_EOS)
+                        eos_llm_lp = llm_lps[eos_idx]
+                        rest_llm_lps = llm_lps[:eos_idx] + llm_lps[eos_idx + 1 :]
+                        eos_gate_score = eos_llm_lp / self._length_norm(len(hyp.words))
+                        if not rest_llm_lps or eos_gate_score >= max(rest_llm_lps):
+                            done.append(
+                                replace(
+                                    hyp,
+                                    words=list(hyp.words),
+                                    score=hyp.score + eos_llm_lp,
+                                    gf_logprob=hyp.gf_logprob,
+                                    llm_logprob=hyp.llm_logprob + eos_llm_lp,
+                                    finished=True,
+                                    past_key_values=None,
+                                    next_start_logits=None,
+                                )
+                            )
+                            n_gated_done += 1
+                            continue
+                        # eos lost the gate -- drop it and let this
+                        # hypothesis compete normally with what's left (the
+                        # grammar's own start-of-sentence candidates)
+                        words_i = words_i[:eos_idx] + words_i[eos_idx + 1 :]
+                        gf_lps = gf_lps[:eos_idx] + gf_lps[eos_idx + 1 :]
+                        llm_lps = llm_lps[:eos_idx] + llm_lps[eos_idx + 1 :]
+                        sentence_end_flags = (
+                            sentence_end_flags[:eos_idx] + sentence_end_flags[eos_idx + 1 :]
+                        )
+                        gf_free_flags = gf_free_flags[:eos_idx] + gf_free_flags[eos_idx + 1 :]
+
+                    for word, gf_lp, sentence_end, gf_free, llm_lp in zip(
+                        words_i, gf_lps, sentence_end_flags, gf_free_flags, llm_lps
                     ):
                         expansions.append(
-                            _Expansion(hyp, word, gf_lp, llm_lp, new_sentence, sentence_end, gf_free)
+                            _Expansion(hyp, word, gf_lp, llm_lp, sentence_end, gf_free)
                         )
 
             if self.do_sample:
@@ -665,36 +778,39 @@ class WordBeamSearcher:
                 continue
 
             if not expansions:
+                if n_gated_done > 0:
+                    # every live hypothesis finished via the "stop the whole
+                    # answer" gate this step (real progress, not a dead end)
+                    # -- `beams` must reflect that nothing is live anymore,
+                    # not keep stale pre-gate copies of the same hypotheses
+                    # around (those would be missing the gate's own eos cost
+                    # and so would always outscore their own correctly-priced
+                    # `done` counterpart).
+                    if self.verbose:
+                        print(
+                            f"[word-step {step_idx:3d}] all {n_gated_done} live hypotheses "
+                            "stopped via the gate, done",
+                            flush=True,
+                        )
+                    beams = []
+                    break
                 if self.verbose:
                     print(f"[word-step {step_idx:3d}] no live expansions, stopping", flush=True)
                 break
 
-            # ---- fuse; EOS candidates are always kept (like the grammar side,
-            # they don't compete for the beam_size live slots), continuations
-            # compete for the top beam_size — only *those* survivors pay for
-            # extracting their own KV-cache row.
+            # ---- fuse: every remaining expansion (real continuation words,
+            # and sentence-end marks, both priced with a real gf_lp -- see
+            # module docstring) competes on equal footing for the top
+            # beam_size slots. `GF_EOS` ("stop the whole answer") never
+            # reaches `expansions` at all: that decision is already settled,
+            # per hypothesis, above.
             t_combine_start = time.perf_counter()
             continuations: List[Tuple[float, _Expansion]] = []
             for e in expansions:
                 step_score = (
                     e.llm_lp if e.gf_free else self.lambda_gf * e.gf_lp + (1.0 - self.lambda_gf) * e.llm_lp
                 )
-                total_score = e.hyp.score + step_score
-                if e.word == GF_EOS:
-                    done.append(
-                        replace(
-                            e.hyp,
-                            words=list(e.hyp.words),
-                            score=total_score,
-                            gf_logprob=e.hyp.gf_logprob + e.gf_lp,
-                            llm_logprob=e.hyp.llm_logprob + e.llm_lp,
-                            finished=True,
-                            past_key_values=None,
-                            next_start_logits=None,
-                        )
-                    )
-                else:
-                    continuations.append((total_score, e))
+                continuations.append((e.hyp.score + step_score, e))
 
             if self.diversity_penalty > 0.0 and len(continuations) > self.beam_size:
                 survivors = self._select_diverse(continuations)
@@ -711,11 +827,11 @@ class WordBeamSearcher:
             new_beams: List[WordHypothesis] = []
             for total_score, e in survivors:
                 new_sentence_words = (
-                    [] if e.sentence_end
-                    else [e.word] if e.new_sentence
-                    else list(e.hyp.sentence_words) + [e.word]
+                    [] if e.sentence_end else list(e.hyp.sentence_words) + [e.word]
                 )
-                cache, next_start_logits = self._materialize(e.hyp, e.word)
+                cache, next_start_logits = self._materialize(
+                    e.hyp, e.word, capitalize=not e.hyp.sentence_words
+                )
                 new_beams.append(
                     replace(
                         e.hyp,
@@ -755,13 +871,15 @@ class WordBeamSearcher:
             if not beams:
                 break
 
-        # under do_sample, chains are independent (like num_return_sequences),
-        # so a chain finishing before another one is not a reason to drop the
-        # still-running one: report *both* finished and still-live chains,
-        # not just whichever happened to reach GF_EOS first. The deterministic
-        # path keeps its original behavior (only fall back to `beams` when
-        # nothing at all finished), unaffected by this.
-        results = done + beams if self.do_sample else (done or beams)
+        # a hypothesis finishing before another one is not a reason to drop
+        # the still-live one from consideration: report *both* finished and
+        # still-live hypotheses and let `_normalized_score` (which respects
+        # `length_penalty`) pick the winner. Discarding every live beam the
+        # moment *anything* finished (this used to be `done or beams`) let
+        # whichever hypothesis happened to stop first -- often the shortest,
+        # since it had the earliest opportunity to -- win by default, no
+        # matter how a longer, still-live alternative would have scored.
+        results = done + beams
         results.sort(key=self._normalized_score, reverse=True)
         return results[: num_return or self.beam_size]
 
@@ -878,7 +996,7 @@ class WordBeamSearcher:
         kept_words, kept_lps, kept_flags = zip(*kept)
         return list(kept_words), list(kept_lps), list(kept_flags)
 
-    def _candidate_ids(self, word: str) -> List[int]:
+    def _candidate_ids(self, word: str, capitalize: bool = False) -> List[int]:
         if word == GF_EOS:
             return [self.tokenizer.eos_token_id]
         if word in self._SENTENCE_END_MARKS:
@@ -886,12 +1004,30 @@ class WordBeamSearcher:
             # unlike ordinary candidates which are mid-sentence and always
             # get a leading space when `prefix_space` is set
             return self.tokenizer.encode(word, add_special_tokens=False)
+        if capitalize and word:
+            # grammar terminals are lowercase except for hardcoded orthographic
+            # exceptions ("I", proper nouns) -- at a true sentence start (see
+            # callers), scoring/feeding the LM the raw lowercase form makes it
+            # judge the candidate against real text, which essentially never
+            # starts a sentence lowercase; that spuriously starves every
+            # candidate except the handful of terminals that already happen to
+            # be capitalized. Only the first character changes (not
+            # `.capitalize()`, which would also lowercase the rest and mangle
+            # a terminal like "John").
+            word = word[0].upper() + word[1:]
         text = (" " + word) if self.prefix_space else word
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def _score_hyp_candidates(self, hyp: WordHypothesis, words: Sequence[str]) -> List[float]:
+    def _score_hyp_candidates(
+        self, hyp: WordHypothesis, words: Sequence[str], capitalize: bool = False
+    ) -> List[float]:
         """Score every candidate word for `hyp`, returning one `llm_lp` per
         candidate, in the same order as `words`.
+
+        `capitalize` -- see `_candidate_ids` -- should be set whenever `words`
+        are candidates for the first word of a (new) sentence, i.e. whenever
+        the caller's `hyp.sentence_words` is empty; it is a no-op for `GF_EOS`
+        and `_SENTENCE_END_MARKS` entries mixed into the same `words` list.
 
         Feeds only each candidate's own tokens, using `hyp`'s cached
         "prompt + hyp.words" as `past_key_values` (expanded across a chunk of
@@ -920,7 +1056,7 @@ class WordBeamSearcher:
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
 
-        token_lists = [self._candidate_ids(w) for w in words]
+        token_lists = [self._candidate_ids(w, capitalize=capitalize) for w in words]
         past_len = hyp.past_key_values.get_seq_length()
         first_lp = torch.log_softmax(hyp.next_start_logits.float(), dim=-1)
 
@@ -985,16 +1121,24 @@ class WordBeamSearcher:
 
         return results
 
-    def _materialize(self, hyp: WordHypothesis, word: str) -> Tuple[DynamicCache, torch.Tensor]:
+    def _materialize(
+        self, hyp: WordHypothesis, word: str, capitalize: bool = False
+    ) -> Tuple[DynamicCache, torch.Tensor]:
         """Run the forward pass for exactly one candidate word (a pruning
         survivor) and return the (cache, next_start_logits) it carries
         forward as the new hypothesis's incremental-decoding state.
 
         Only called for the `beam_size`-ish survivors of a step, never for
         every scored candidate — see `_score_hyp_candidates` and `_Expansion`.
+
+        `capitalize` -- see `_candidate_ids` -- must match whatever `_score_
+        hyp_candidates` used to score `word` for this same `hyp`/step, so the
+        tokens actually fed into the model (and thus its cache/context for
+        every later step) agree with what was scored, not the raw lowercase
+        grammar terminal.
         """
         device = next(self.model.parameters()).device
-        ids = self._candidate_ids(word)
+        ids = self._candidate_ids(word, capitalize=capitalize)
         k = len(ids)
         past_len = hyp.past_key_values.get_seq_length()
 
