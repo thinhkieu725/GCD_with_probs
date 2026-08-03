@@ -77,7 +77,7 @@ NUM_BEAMS = 2
 # here for fast iteration; raise it for an occasional slower "final" run.
 MAX_NEW_TOKENS = 48
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any GFProbConstraint (baseline)
-
+SHOW_TIMER = False  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
 # ============================================================= /CONFIG =====
 
 
@@ -207,7 +207,7 @@ def stage4_load_model_and_constraint(
         lambda_gf=lambda_gf,
         gf_temperature=GF_TEMPERATURE,
         id_prefix=ID_PREFIX,
-        verbose=True # log the progress
+        verbose=SHOW_TIMER # log the progress
     )
 
 

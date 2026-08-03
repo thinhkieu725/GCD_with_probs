@@ -18,7 +18,7 @@ distributions for both.
 | fusion formula         | `ln P_LM + λ·ln P_GF`, λ ≥ 0                   | `λ·ln P_GF + (1−λ)·ln P_LM`, λ ∈ [0,1]     |
 | λ = 0 means            | binary GCD (mask only)                         | LM chooses among legal words               |
 | grammar cost lands on  | first subtoken of each word                    | the word, atomically                       |
-| HF features (sampling, length penalty, batching, …) | free                    | only what `word_beam.py` implements        |
+| HF features (sampling, length penalty, batching, …) | free                    | hand-implemented (`length_penalty`, `diversity_penalty`, `no_repeat_ngram_size`, and a `do_sample` temperature/top-k/top-p/min-p/typical-p mode); no batching across prompts |
 
 Both formulas are log-linear interpolations; they differ only in
 normalization of λ.
@@ -56,9 +56,14 @@ inside HF's token loop:
 3. **Every decoding step** — HF calls
    [`GFProbLogitsProcessor.__call__`](../gf_gcd/constraints.py) with one
    row per beam hypothesis:
-   - strip the prompt, render generated IDs as grammar tokens
-     (`["t100", "t300"]`);
-   - query `next_token_logprobs` → `{token: ln P_GF}` incl. `GF_EOS`;
+   - strip the prompt, then locate the current *sentence* boundary within
+     what's left (`_SentenceCursor` — the grammar accepts one sentence, so
+     only the tail generated since the last boundary is rendered to
+     grammar tokens, e.g. `["t100", "t300"]`);
+   - query `next_token_logprobs` → `{token: ln P_GF}` incl. `GF_EOS`; at a
+     forced boundary (no legal continuation left) also fuse in the
+     grammar's own start-of-sentence tokens, so a beam can chain into
+     another sentence instead of only being allowed to stop;
    - `fused[t] = scores[t] + λ·ln P_GF(t)` for allowed `t`, `−inf`
      otherwise; `GF_EOS` maps to the real `eos_token_id`;
    - finished rows (EOS already emitted) pass through EOS/pad only.
@@ -71,9 +76,14 @@ inside HF's token loop:
 Loop in [`WordBeamSearcher.search`](../gf_gcd/word_beam.py); each
 iteration grows every hypothesis by one word:
 
-1. **Propose** — per hypothesis, `next_token_logprobs(hyp.words)` lists
-   legal next words with `ln P_GF` (incl. `GF_EOS` when stopping is
-   legal). The grammar is the proposer: nothing else can enter a beam.
+1. **Propose** — per hypothesis, `next_token_logprobs(hyp.sentence_words)`
+   (the current *sentence*'s words, not the hypothesis's whole history —
+   the grammar accepts only one sentence) lists legal next words with
+   `ln P_GF` (incl. `GF_EOS` when stopping is legal). At a forced boundary
+   (`GF_EOS` the only option), the proposer also offers the grammar's
+   start-of-sentence words, each forking the hypothesis into "begin
+   another sentence" alongside "end here". The grammar is the proposer:
+   nothing else can enter a beam.
 2. **Score** — `_score_expansions` computes
    `ln P_LM(word | prompt + words)` as the **sum of the word's subtoken
    log-probs** — e.g.
@@ -89,6 +99,19 @@ iteration grows every hypothesis by one word:
 
 `WordHypothesis` keeps `gf_logprob` and `llm_logprob` separately, so you
 can always see which expert drove a result.
+
+Step 3 above is `WordBeamSearcher`'s deterministic mode (`do_sample=False`,
+the default): all hypotheses' extensions are pooled into one list and the
+globally top `beam_size` survive. Passing `do_sample=True` swaps that step
+for **independent per-hypothesis sampling**: each hypothesis draws its own
+next word from its own `step = λ·ln P_GF + (1−λ)·ln P_LM` distribution after
+temperature scaling and top-k/top-p/min-p/typical-p filtering (the same
+cascade `transformers.generate(do_sample=True, ...)` uses, just over a
+grammar step's candidate words instead of the LM's vocabulary) — hypotheses
+never compete with each other, so `beam_size` becomes "number of independent
+parallel chains" and `GF_EOS` is just another candidate in the draw rather
+than an automatic survivor. See `WordBeamSearcher.__init__`'s `do_sample`
+argument and `_sample_index`.
 
 ## The unfair mid-word score problem
 
@@ -151,8 +174,10 @@ aligned per word).
 - (+) Probabilistically clean: fusion aligned at word boundaries; EOS
   competes against continuations on both sides of the interpolation.
 - (+) Transparent output (`gf_logprob` / `llm_logprob` per hypothesis).
-- (−) Hand-rolled search: no sampling, no HF conveniences; more code to
-  maintain.
+- (+) Has its own `do_sample` mode (temperature/top-k/top-p/min-p/typical-p),
+  as an alternative to its deterministic beam search — see above.
+- (−) Hand-rolled search: more code to maintain than Phase 1's ~100 lines on
+  top of HF `generate`; no batching across prompts.
 - (−) Recomputes the full context every step (no KV-cache reuse across
   steps — deliberate, see docstring; negligible at tens of words but the
   first thing to optimize for long outputs).
@@ -175,8 +200,9 @@ cannot be advanced by both. Sequential composition works naturally:
 
 ## When to use which
 
-- Production-style decoding, many prompts, want sampling or HF options →
-  **Phase 1**.
+- Production-style decoding, many prompts, batching, or other HF-`generate`
+  conveniences (repetition penalty, per-sample grammars, …) → **Phase 1**
+  (sampling is available in both — see `do_sample` above for Phase 2's).
 - Model-agnostic setups, research on the fusion itself, need faithful
   word-level probabilities or interpretable per-expert scores →
   **Phase 2**.

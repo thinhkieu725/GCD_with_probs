@@ -73,14 +73,40 @@ if DEVICE_MAP == "mps":
     # (multiple threads calling tensor.to(device="mps") concurrently) and segfaults
     # during from_pretrained — force sequential loading. See docs/device_setup.md.
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-LAMBDAS = [0.0, 0.1, 0.3, 1.0]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
-MAX_WORDS = 8              # ditto
-LENGTH_ALPHA = 1.0         # rank hypotheses by score / len(words)**LENGTH_ALPHA; 0.0 = raw cumulative score
+MAX_WORDS = 40              # ditto
 NUM_RETURN = 1
+# Search-quality knobs (see WordBeamSearcher.__init__ for the full rationale
+# behind each). None of these change lambda_gf's grammar/LM tradeoff -- they
+# make the beam search around it smarter.
+LENGTH_PENALTY = 0.8       # GNMT-style exponent; 0 = off (raw log-prob sum, biased toward
+                           # whichever hypothesis finishes fewer words first); ~0.6-1.0 corrects it
+DIVERSITY_PENALTY = 0.3    # per-step penalty on a word already claimed by a higher-ranked
+                           # survivor this step; 0 = off, larger = more lexically diverse beam
+NO_REPEAT_NGRAM_SIZE = 3   # block candidates that would recreate an already-seen n-gram; 0 = off
+
+# Decoding mode: "beam" (deterministic, pooled word-synchronized beam search,
+# the knobs above) or "sample" (independent per-chain temperature/top-p/top-k
+# sampling -- see WordBeamSearcher.__init__'s `do_sample` docstring). Switch
+# by editing this one constant; DIVERSITY_PENALTY above is ignored (must be 0)
+# in "sample" mode since it only makes sense for the pooled beam competition.
+CANDIDATE_TOP_K = 0             # keep only the top_k highest-fused-score candidates; 0 = off
+CANDIDATE_TOP_P = 1.0           # nucleus sampling cumulative-probability cutoff; 1.0 = off
+
+DECODING_MODE = "sample"     # "beam" | "sample"
+SAMPLE_NUM_CHAINS = 4      # independent parallel chains in "sample" mode (replaces BEAM_SIZE's role)
+SAMPLE_TEMPERATURE = 0.85   # scales the *fused* score before top-k/top-p/min-p/typical-p; ~0 = greedy
+SAMPLE_TOP_K = 60           # keep only the top_k highest-fused-score candidates; 0 = off
+SAMPLE_TOP_P = 0.9         # nucleus sampling cumulative-probability cutoff; 1.0 = off
+SAMPLE_MIN_P = 0.0         # keep candidates >= min_p * (top candidate's probability); 0.0 = off
+SAMPLE_TYPICAL_P = 1.0     # locally typical sampling cumulative-probability cutoff; 1.0 = off
+SAMPLE_SEED = None         # set an int for reproducible sampling runs
+
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
 BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
+SHOW_TIMER = False  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
 
 # ============================================================= /CONFIG =====
 
@@ -117,31 +143,66 @@ def stage1_compile_word_level_grammar() -> Path:
 
 
 def stage5_generate(generator: ConstrainedGenerator, runtime: GFProbRuntime, prompt: str) -> None:
-    """Run one word-synchronized beam search per configured lambda and print the results."""
-    print(f"\nmodel={MODEL_NAME}  prompt={prompt!r}")
+    """Run one word-synchronized search per configured lambda and print the results."""
+    if DECODING_MODE not in ("beam", "sample"):
+        raise ValueError(f"DECODING_MODE must be 'beam' or 'sample', got {DECODING_MODE!r}")
+
+    print(f"\nmodel={MODEL_NAME}  prompt={prompt!r}  decoding_mode={DECODING_MODE!r}")
+    display_beam_size = BEAM_SIZE if DECODING_MODE == "beam" else SAMPLE_NUM_CHAINS
 
     if INCLUDE_BASELINE_WITHOUT_CONSTRAINT:
-        print(f"baseline (no grammar fusion, num_beams={BEAM_SIZE}):")
+        if DECODING_MODE == "beam":
+            print(f"baseline (no grammar fusion, num_beams={display_beam_size}):")
+            baseline_kwargs = dict(num_beams=display_beam_size)
+        else:
+            # match WordBeamSearcher's sampling mode below, so the baseline
+            # is a fair comparison instead of silently falling back to beam
+            # search while the constrained side samples
+            print("baseline (no grammar fusion, do_sample=True):")
+            baseline_kwargs = dict(
+                do_sample=True,
+                temperature=SAMPLE_TEMPERATURE,
+                top_k=SAMPLE_TOP_K,
+                top_p=SAMPLE_TOP_P,
+                min_p=SAMPLE_MIN_P,
+                typical_p=SAMPLE_TYPICAL_P,
+                seed=SAMPLE_SEED,
+            )
         result = generator.generate(
-            prompt, constraint=None, max_new_tokens=BASELINE_MAX_NEW_TOKENS, num_beams=BEAM_SIZE
+            prompt, constraint=None, max_new_tokens=BASELINE_MAX_NEW_TOKENS, **baseline_kwargs
         )
         print(f"  unconstrained  ->  {result.first_texts[0]!r}")
 
-    print(f"word-level fusion (WordBeamSearcher, beam={BEAM_SIZE}):")
-    for lam in LAMBDAS:
-        searcher = WordBeamSearcher(
-            generator.model,
-            generator.tokenizer,
-            runtime,
-            lambda_gf=lam,
-            beam_size=BEAM_SIZE,
-            gf_temperature=GF_TEMPERATURE,
-            length_alpha=LENGTH_ALPHA,
+    searcher_kwargs = dict(
+        gf_temperature=GF_TEMPERATURE,
+        length_penalty=LENGTH_PENALTY,
+        no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+        verbose=SHOW_TIMER,
+    )
+    if DECODING_MODE == "beam":
+        print(f"word-level fusion (WordBeamSearcher, beam={BEAM_SIZE}):")
+        searcher_kwargs.update(beam_size=BEAM_SIZE, diversity_penalty=DIVERSITY_PENALTY)
+    else:
+        print(f"word-level fusion (WordBeamSearcher, do_sample=True, chains={SAMPLE_NUM_CHAINS}):")
+        searcher_kwargs.update(
+            candidate_top_k=CANDIDATE_TOP_K,
+            candidate_top_p=CANDIDATE_TOP_P,
+            beam_size=SAMPLE_NUM_CHAINS,
+            do_sample=True,
+            temperature=SAMPLE_TEMPERATURE,
+            top_k=SAMPLE_TOP_K,
+            top_p=SAMPLE_TOP_P,
+            min_p=SAMPLE_MIN_P,
+            typical_p=SAMPLE_TYPICAL_P,
+            seed=SAMPLE_SEED,
         )
+
+    for lam in LAMBDAS:
+        searcher = WordBeamSearcher(generator.model, generator.tokenizer, runtime, lambda_gf=lam, **searcher_kwargs)
         hyps = searcher.search(prompt, max_words=MAX_WORDS, num_return=NUM_RETURN)
         best = hyps[0]
         print(
-            f"  lambda={lam:4.1f}  ->  {best.text!r}   "
+            f"  lambda={lam:4.3f}  ->  {best.text!r}   "
             f"(gf={best.gf_logprob:6.2f}, lm={best.llm_logprob:7.2f})"
         )
 

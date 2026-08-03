@@ -27,13 +27,23 @@ def prob_grammar_dir(tmp_path_factory) -> Path:
     """Toy grammars compiled with probability files (for GFProbRuntime & co).
 
     SeqTok uses letter-prefixed terminals ("t100"): digit-only terminals break
-    the C runtime's complete().
+    the C runtime's complete(). Its two functions (`Short`, `Long`) each
+    contribute more than one literal token ("t100" ++ "t200", ...), which
+    trips a *different* C runtime bug: `complete()` errors on a prefix that
+    ends strictly inside one function's own literal run (see
+    `docs/chainify_limitations.md` and `gf_gcd.grammar_tools.chainify`).
+    Compiling through `chainify_and_compile` restructures those functions so
+    every one contributes a single token, sidestepping it -- needed here
+    because tests probe `next_token_logprobs` mid-derivation (e.g. right
+    after "t100"), which is exactly the position that bug hits.
     """
     from gf_gcd.grammar_tools import compile_grammar
+    from gf_gcd.grammar_tools.chainify import chainify_and_compile
 
     out = tmp_path_factory.mktemp("pgf_probs")
     compile_grammar(TOY_GRAMMAR_SRC / "FoodEng.gf", out, probs_file=TOY_GRAMMAR_SRC / "Food.probs")
-    compile_grammar(
+    chainify_and_compile(
+        TOY_GRAMMAR_SRC / "Seq.gf",
         TOY_GRAMMAR_SRC / "SeqTok.gf",
         out,
         output_name="SeqTok",
