@@ -92,8 +92,8 @@ NO_REPEAT_NGRAM_SIZE = 3   # block candidates that would recreate an already-see
 # sampling -- see WordBeamSearcher.__init__'s `do_sample` docstring). Switch
 # by editing this one constant; DIVERSITY_PENALTY above is ignored (must be 0)
 # in "sample" mode since it only makes sense for the pooled beam competition.
-CANDIDATE_TOP_K = 0             # keep only the top_k highest-fused-score candidates; 0 = off
-CANDIDATE_TOP_P = 1.0           # nucleus sampling cumulative-probability cutoff; 1.0 = off
+CANDIDATE_TOP_K = 0             # keep only the top_k highest-gf-score candidates; 0 = off
+CANDIDATE_TOP_P = 1.0         # nucleus sampling cumulative-probability cutoff; 1.0 = off
 
 DECODING_MODE = "sample"     # "beam" | "sample"
 SAMPLE_NUM_CHAINS = 4      # independent parallel chains in "sample" mode (replaces BEAM_SIZE's role)
@@ -106,7 +106,7 @@ SAMPLE_SEED = None         # set an int for reproducible sampling runs
 
 INCLUDE_BASELINE_WITHOUT_CONSTRAINT = True  # if True, also run the model without any grammar fusion (baseline)
 BASELINE_MAX_NEW_TOKENS = 48  # unconstrained generation has no word-level stopping rule, so it needs its own token budget
-SHOW_TIMER = False  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
+SHOW_TIMER = True  # if True, log the time spent in GFProbConstraint.complete() and .score() (useful for profiling)
 
 # ============================================================= /CONFIG =====
 

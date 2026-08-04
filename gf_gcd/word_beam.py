@@ -955,6 +955,8 @@ class WordBeamSearcher:
         to `_filter_top_k`/`_filter_top_p` (the `do_sample` warpers) as-is:
         softmax of an already-normalized log-distribution just recovers it.
         """
+        if not words:
+            return words, gf_lps, flags
         eos_idx = words.index(GF_EOS) if GF_EOS in words else None
         logits = torch.tensor(gf_lps, dtype=torch.float32)
         if self.candidate_top_k > 0:
