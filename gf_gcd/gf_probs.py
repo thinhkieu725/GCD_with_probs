@@ -12,10 +12,16 @@ Semantics recovered from the C runtime:
   `prefix + token` (Viterbi prefix cost, on the same scale across candidates
   of one step). Duplicate tokens (same surface, different derivations) must
   be merged by summing their probabilities (logsumexp on -cost).
-- `Concr.parse(sentence)` iterates trees best-first; the first tree's cost is
-  the Viterbi cost of stopping here. Because it lives on the same cumulative
-  scale as the continuation costs, normalizing over {stop} ∪ {continuations}
-  yields a proper conditional including P(end of sentence | prefix).
+- `Concr.parse(sentence)` iterates trees best-first, one cost per distinct
+  derivation of the whole sentence -- the parse-tree analog of `complete`'s
+  per-derivation costs. Just like `complete`, ambiguity is resolved by
+  merging (logsumexp on -cost) rather than keeping only the best tree, so
+  P(stop here) = Σ_trees P(tree), on the same cumulative scale as the
+  continuation costs; normalizing over {stop} ∪ {continuations} yields a
+  proper conditional including P(end of sentence | prefix). Only the
+  `max_eos_trees` best trees are pulled (parse ambiguity can otherwise be
+  combinatorial); costs decay quickly in a best-first iterator, so the
+  truncated tail contributes negligible probability mass in practice.
 """
 
 import math
@@ -56,6 +62,7 @@ class GFProbRuntime:
         default_pgf: Optional[str] = None,
         concrete: Optional[str] = None,
         cache_size: int = 4096,
+        max_eos_trees: int = 10,
     ):
         """
         Args:
@@ -65,6 +72,9 @@ class GFProbRuntime:
                 concrete in the grammar, error if it is ambiguous.
             cache_size: number of (grammar, prefix) -> distribution entries
                 kept; beams revisit the same prefixes constantly.
+            max_eos_trees: max number of best-first parse trees merged into
+                the "stop here" probability (see class docstring); best-first
+                order means the trees left out are the least likely ones.
         """
         if pgf is None:
             raise ImportError(
@@ -79,6 +89,7 @@ class GFProbRuntime:
         self._lock = threading.Lock()
         self._cache: Dict[tuple, Dict[str, float]] = {}
         self._cache_size = cache_size
+        self._max_eos_trees = max_eos_trees
 
     # ------------------------------------------------------------- grammars
 
@@ -156,10 +167,16 @@ class GFProbRuntime:
 
         if include_eos and prefix_tokens:
             try:
-                best_cost, _tree = next(concr.parse(prefix.strip()))
-                merged[GF_EOS] = -best_cost
-            except (pgf.ParseError, StopIteration):
-                pass
+                tree_costs = [
+                    -cost
+                    for cost, _tree in concr.parse(
+                        prefix.strip(), n=self._max_eos_trees
+                    )
+                ]
+            except pgf.ParseError:
+                tree_costs = []
+            if tree_costs:
+                merged[GF_EOS] = _logsumexp(tree_costs)
 
         if not merged:
             result: Dict[str, float] = {}

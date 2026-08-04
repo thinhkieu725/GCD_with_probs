@@ -7,3 +7,5 @@ dist/
 grammars/**/*.pgf
 grammars/**/*.gfo
 .venv/
+
+output
