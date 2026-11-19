@@ -12,3 +12,6 @@ accelerate>=0.26
 # CUDA-only 4-bit quantized loading; not available on mps or CPU-only.
 # Uncomment if running on CUDA with QUANTIZATION_CONFIG set.
 # bitsandbytes>=0.43
+
+# Grammatical Framework
+pgf=1.1

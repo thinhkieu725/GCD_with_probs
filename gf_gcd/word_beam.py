@@ -1065,12 +1065,25 @@ class WordBeamSearcher:
         past_len = hyp.past_key_values.get_seq_length()
         first_lp = torch.log_softmax(hyp.next_start_logits.float(), dim=-1)
 
-        results: List[float] = []
+        # Candidates vary widely in token length (1 to ~5 subwords), but each
+        # chunk pads every row up to its longest candidate -- and padding
+        # isn't free, attention + every linear layer still runs over those
+        # positions before they're masked out above. Sorting by length before
+        # chunking groups same-length candidates together, so chunks pad to
+        # ~their own length instead of the batch's worst case. Pure
+        # reordering: each row is scored independently against `hyp`'s cache,
+        # so shuffling which rows land in the same chunk can't change any
+        # result, only how much padding it costs to compute it. Unsorted
+        # below so the returned list still lines up with `words`.
+        order = sorted(range(len(token_lists)), key=lambda i: len(token_lists[i]))
+        sorted_token_lists = [token_lists[i] for i in order]
+
+        sorted_results: List[float] = []
         n_chunks = 0
         forward_s = 0.0  # model forward + log_softmax + gather over its logits
         postprocess_s = 0.0  # pulling the batched result off the GPU
-        for start in range(0, len(token_lists), self.scoring_chunk_size):
-            chunk = token_lists[start : start + self.scoring_chunk_size]
+        for start in range(0, len(sorted_token_lists), self.scoring_chunk_size):
+            chunk = sorted_token_lists[start : start + self.scoring_chunk_size]
             m = len(chunk)
             max_k = max(len(ids) for ids in chunk)
 
@@ -1112,9 +1125,13 @@ class WordBeamSearcher:
             forward_s += t1 - t0
             n_chunks += 1
 
-            results.extend(step_lp.tolist())  # one GPU/CPU sync for the whole chunk
+            sorted_results.extend(step_lp.tolist())  # one GPU/CPU sync for the whole chunk
             postprocess_s += time.perf_counter() - t1
             del out, logprobs, cache
+
+        results: List[float] = [0.0] * len(order)
+        for pos, i in enumerate(order):
+            results[i] = sorted_results[pos]
 
         if self.verbose:
             print(

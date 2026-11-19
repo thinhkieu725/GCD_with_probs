@@ -73,7 +73,8 @@ if DEVICE_MAP == "mps":
     # (multiple threads calling tensor.to(device="mps") concurrently) and segfaults
     # during from_pretrained — force sequential loading. See docs/device_setup.md.
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+#LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+LAMBDAS = [0.01]
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
 MAX_WORDS = 40              # ditto
