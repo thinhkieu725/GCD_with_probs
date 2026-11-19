@@ -75,7 +75,8 @@ QUANTIZATION_CONFIG = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_use_double_quant=True,
 )  # requires `bitsandbytes`; keeps a 7-8B model comfortably under 12GB VRAM
-LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+#LAMBDAS = [0.0, 0.01, 0.03, 0.05, 0.1, 0.3]  # grammar weight sweep; lambda_gf must be in [0, 1] here
+LAMBDAS = [0.01]
 GF_TEMPERATURE = 1.0       # >1 flattens the grammar's distribution towards uniform-over-allowed
 BEAM_SIZE = 2              # kept small — see the cost warning in the module docstring
 MAX_WORDS = 40              # ditto
